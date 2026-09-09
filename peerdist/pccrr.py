@@ -16,7 +16,7 @@ from collections.abc import Buffer, MutableMapping, Sequence
 from dataclasses import dataclass, field
 from enum import IntEnum
 from struct import Struct
-from typing import ClassVar, Self
+from typing import cast, ClassVar, Self, TypeVar
 
 
 UINT32 = Struct(">I")
@@ -194,6 +194,9 @@ class Encoder:
         self.uint32(len(ranges))
 
 
+MessageT = TypeVar('MessageT', bound='Message')
+
+
 @dataclass(kw_only=True)
 class Message:
     """Message"""
@@ -218,17 +221,18 @@ class Message:
             cls._MSG_TYPES[cls.MSG_TYPE] = cls
 
     @classmethod
-    def from_bytes(cls, data: Buffer) -> Message:
+    def from_bytes(cls: type[MessageT], data: Buffer) -> MessageT:
         """Message decoded from a byte sequence"""
         decoder = Decoder(data=memoryview(data))
+        subcls: type[MessageT] = cls
         if not hasattr(cls, 'MSG_TYPE'):
-            cls = cls.autodetect(decoder)
+            subcls = cls.autodetect(decoder)
             decoder.reset()
-        self = cls.decode(decoder)
+        self = subcls.decode(decoder)
         if decoder.remaining:
             raise DecodeError("unextracted bytes at offset %d (of %d)" %
                               (decoder.offset, decoder.len))
-        return self
+        return cast(MessageT, self)
 
     def to_buffers(self) -> Sequence[Buffer]:
         """Message encoded as a buffer sequence"""
