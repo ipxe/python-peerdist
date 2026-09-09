@@ -13,7 +13,7 @@ entirely unrelated Discovery Protocol.)
 from __future__ import annotations
 
 from collections.abc import Buffer, MutableMapping, Sequence
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 from enum import IntEnum
 from struct import Struct
 from typing import ClassVar, Self
@@ -203,11 +203,12 @@ class Message:
     MSG_TYPE: ClassVar[MsgType]
     """Message type"""
 
-    _MSG_TYPES: ClassVar[MutableMapping[MsgType, type[Self]]]
+    _MSG_TYPES: ClassVar[MutableMapping[MsgType, type[Self]]] = {}
 
     def __init_subclass__(cls: type[Self], **kwargs) -> None:
         super().__init_subclass__(**kwargs)
         if getattr(cls, 'MSG_TYPE', None) is not None:
+            assert cls.MSG_TYPE not in cls._MSG_TYPES
             cls._MSG_TYPES[cls.MSG_TYPE] = cls
 
     @classmethod
@@ -241,22 +242,20 @@ class Message:
             cls = cls.autodetect(decoder)
             decoder.reset()
         self = cls.decode(decoder)
+        if decoder.remaining:
+            raise DecodeError("trailing bytes at offset %d (of %d)" %
+                              (decoder.offset, decoder.len))
         return self
 
     @classmethod
     def autodetect(cls, decoder: Decoder) -> type[Self]:
         """Autodetect message type"""
-        remaining = decoder.remaining
-        (prot_ver, msg_type, length, crypto_alg_id) = decoder.unpack(UINT32x4)
+        (_, msg_type, _, _) = decoder.unpack(UINT32x4)
         if msg_type not in MsgType:
             raise DecodeError("unrecognised message type %d" % msg_type)
-        if length != remaining:
-            raise DecodeError("message header length %d does not match %d" %
-                              (length, remaining))
-        subcls = cls._MSG_TYPES.get(MsgType(msg_type), None)
-        if subcls is None:
+        if msg_type not in cls._MSG_TYPES:
             raise DecodeError("unregistered message type %d" % msg_type)
-        return subcls
+        return cls._MSG_TYPES[MsgType(msg_type)]
 
     @classmethod
     def decode(cls, decoder: Decoder) -> Message:
@@ -301,9 +300,6 @@ class Response(Message):
     def autodetect(cls, decoder: Decoder) -> type[Self]:
         """Autodetect message type"""
         length = decoder.uint32()
-        if length != decoder.remaining:
-            raise DecodeError("response header length %d does not match %d" %
-                              (length, decoder.remaining))
         return super().autodetect(decoder)
 
     @classmethod
@@ -350,10 +346,10 @@ class MsgGetBlks(Request):
         req_block_ranges = decoder.ranges()
         vrf = bytes(decoder.sized())
         return cls(
+            crypto_alg_id=self.crypto_alg_id,
             segment_id=segment_id,
             req_block_ranges=req_block_ranges,
             vrf=vrf,
-            **asdict(self)
         )
 
     def encode(self, encoder: Encoder) -> None:
@@ -402,13 +398,13 @@ class MsgBlk(Response):
         vrf = bytes(decoder.sized())
         iv = bytes(decoder.sized())
         return cls(
+            crypto_alg_id=self.crypto_alg_id,
             segment_id=segment_id,
             block_index=block_index,
             next_block_index=next_block_index,
             block=block,
             vrf=vrf,
             iv=iv,
-            **asdict(self)
         )
 
     def encode(self, encoder: Encoder) -> None:
