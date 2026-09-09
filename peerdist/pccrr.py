@@ -83,18 +83,19 @@ class Encoder:
     @property
     def elements(self) -> Sequence[Buffer]:
         """Encoded elements"""
-        return (memoryview(self.head).toreadonly(), *self.tail)
+        return (bytes(self.head), *self.tail)
 
     def raw(self, element: Buffer, split=False) -> None:
         """Prepend a raw element"""
-        if element:
-            memory = memoryview(element)
+        memory = memoryview(element)
+        length = memory.nbytes
+        if length:
             if split:
                 self.tail[:0] = (memory, memoryview(self.head).toreadonly())
                 self.head = bytearray()
             else:
-                self.head[:0] = element
-            self.length += memory.nbytes
+                self.head[:0] = memory
+            self.length += length
 
     def pack(self, struct: Struct, *args: int) -> None:
         """Prepend a packed structure"""
