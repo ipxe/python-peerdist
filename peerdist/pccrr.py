@@ -210,15 +210,23 @@ class Message:
         if getattr(cls, 'MSG_TYPE', None) is not None:
             cls._MSG_TYPES[cls.MSG_TYPE] = cls
 
+    @classmethod
+    def from_bytes(cls, data: Buffer) -> Message:
+        """Message decoded from a byte sequence"""
+        return cls.decoded(data)
+
+    def to_bytes(self) -> bytes:
+        """Message encoded as a byte sequence"""
+        return b''.join(self.encoded())
+
     def __bytes__(self) -> bytes:
         """Message encoded as a byte sequence"""
-        return b''.join(self.encoded)
+        return self.to_bytes()
 
     def hex(self) -> str:
         """Message encoded as a hexadecimal string"""
         return bytes(self).hex()
 
-    @property
     def encoded(self) -> Sequence[Buffer]:
         """Message encoded as a buffer sequence"""
         encoder = Encoder()
@@ -229,16 +237,11 @@ class Message:
     def decoded(cls, data: Buffer) -> Message:
         """Message decoded from a byte sequence"""
         decoder = Decoder(data=memoryview(data))
+        if not hasattr(cls, 'MSG_TYPE'):
+            cls = cls.autodetect(decoder)
+            decoder.reset()
         self = cls.decode(decoder)
         return self
-
-    @classmethod
-    def from_bytes(cls, data: Buffer) -> Message:
-        """Message autodetected and decoded from a byte sequence"""
-        decoder = Decoder(data=memoryview(data))
-        subcls = cls.autodetect(decoder)
-        decoder.reset()
-        return subcls.decode(decoder)
 
     @classmethod
     def autodetect(cls, decoder: Decoder) -> type[Self]:
