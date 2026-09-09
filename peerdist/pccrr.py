@@ -12,12 +12,11 @@ entirely unrelated Discovery Protocol.)
 
 from __future__ import annotations
 
-import base64
-from collections.abc import Buffer, Mapping, MutableSequence, Sequence
+from collections.abc import Buffer, Sequence
 from dataclasses import dataclass, field
 from enum import IntEnum
 from struct import Struct
-from typing import ClassVar, Optional
+from typing import ClassVar
 
 
 UINT32 = Struct(">I")
@@ -68,28 +67,36 @@ class Range:
     """Number of blocks in range"""
 
 
-@dataclass
+@dataclass(kw_only=True)
 class Encoder:
     """Message encoder"""
 
-    elements: MutableSequence[Buffer] = field(
-        default_factory=lambda: [bytearray()]
-    )
-    """List of encoded elements"""
+    head: bytearray = field(default_factory=bytearray)
+    """First encoded element"""
+
+    tail: list[Buffer] = field(default_factory=list)
+    """Remaining encoded elements"""
 
     length: int = 0
     """Total length of encoded elements"""
 
+    @property
+    def elements(self) -> Sequence[Buffer]:
+        """Encoded elements"""
+        return (memoryview(self.head).toreadonly(), *self.tail)
+
     def raw(self, element: Buffer, split=False) -> None:
         """Prepend a raw element"""
         if element:
+            memory = memoryview(element)
             if split:
-                self.elements[:0] = (bytearray(), element)
+                self.tail[:0] = (memory, memoryview(self.head).toreadonly())
+                self.head = bytearray()
             else:
-                self.elements[0][:0] = element
-            self.length += len(element)
+                self.head[:0] = element
+            self.length += memory.nbytes
 
-    def pack(self, struct, *args) -> None:
+    def pack(self, struct: Struct, *args: int) -> None:
         """Prepend a packed structure"""
         self.raw(struct.pack(*args))
 
@@ -103,7 +110,7 @@ class Encoder:
         The element will be zero-padded to a four-byte boundary if it
         is not the last element.
         """
-        length = len(element)
+        length = memoryview(element).nbytes
         if self.length:
             self.raw(bytes(-length % 4))
         if length:
@@ -124,34 +131,33 @@ class Message:
     crypto_alg_id: CryptoAlgId = CryptoAlgId.NONE
     """Encryption algorithm"""
 
-    PROT_VER: ClassVar[Optional[ProtVer]] = None
+    PROT_VER: ClassVar[ProtVer]
     """Protocol version for this message type"""
 
-    MSG_TYPE: ClassVar[Optional[MsgType]] = None
+    MSG_TYPE: ClassVar[MsgType]
     """Message type"""
 
-    _MSG_TYPES: ClassVar[Mapping[MsgType, type[Message]]] = {}
+    _MSG_TYPES: ClassVar[dict[MsgType, type[Message]]] = {}
 
     def __init_subclass__(cls, **kwargs) -> None:
         super().__init_subclass__(**kwargs)
-        if cls.MSG_TYPE is not None:
+        if getattr(cls, 'MSG_TYPE', None) is not None:
             Message._MSG_TYPES[cls.MSG_TYPE] = cls
 
     def __bytes__(self) -> bytes:
         """Message encoded as a byte sequence"""
         return b''.join(self.encoded)
 
-    @property
     def hex(self) -> str:
         """Message encoded as a hexadecimal string"""
-        return base64.b16encode(bytes(self)).decode().lower()
+        return bytes(self).hex()
 
     @property
     def encoded(self) -> Sequence[Buffer]:
         """Message encoded as a buffer sequence"""
         encoder = Encoder()
         self.encode(encoder)
-        return tuple(memoryview(x).toreadonly() for x in encoder.elements)
+        return encoder.elements
 
     def encode(self, encoder: Encoder) -> None:
         """Encode message"""
@@ -188,7 +194,9 @@ class MsgGetBlks(Request):
     segment_id: bytes
     """Segment identifier"""
 
-    req_block_ranges: Sequence[Range] = (Range(index=0, count=1),)
+    req_block_ranges: Sequence[Range] = field(
+        default_factory=lambda: [Range(index=0, count=1)]
+    )
     """List of requested block ranges"""
 
     vrf: bytes = b''
@@ -221,7 +229,7 @@ class MsgBlk(Response):
     next_block_index: int = 0
     """Next block index (or zero if no next block exists)"""
 
-    block: memoryview = memoryview(b'')
+    block: Buffer = b''
     """Encrypted data block"""
 
     vrf: bytes = b''
