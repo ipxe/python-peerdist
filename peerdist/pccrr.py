@@ -60,11 +60,66 @@ class CryptoAlgId(IntEnum):
 class Range:
     """Block or segment range specifier"""
 
-    index: int
+    index: int = 0
     """Index of first block in range"""
 
-    count: int
+    count: int = 1
     """Number of blocks in range"""
+
+
+class DecodeError(Exception):
+    """Malformed protocol data"""
+
+
+@dataclass(kw_only=True)
+class Decoder:
+    """Message decoder"""
+
+    data: memoryview
+    """Raw data"""
+
+    offset: int = 0
+    """Position within original data"""
+
+    @property
+    def remaining(self) -> int:
+        """Length of data remaining"""
+        return (self.data.nbytes - self.offset)
+
+    def raw(self, length: int) -> memoryview:
+        """Extract raw bytes"""
+        offset = self.offset
+        if length > self.remaining:
+            raise DecodeError("too short for %d bytes at offset %d (of %d)" %
+                              (length, offset, self.data.nbytes))
+        data = self.data[offset:(offset + length)].toreadonly()
+        self.offset += length
+        return data
+
+    def unpack(self, struct: Struct) -> Sequence[int]:
+        """Extract a packed structure"""
+        return struct.unpack(self.raw(struct.size))
+
+    def uint32(self) -> int:
+        """Extract an unsigned 32-bit integer"""
+        return self.unpack(UINT32)[0]
+
+    def sized(self) -> Buffer:
+        """Extract a variably-sized element"""
+        size = self.uint32()
+        data = self.raw(size)
+        if self.offset < self.data.nbytes:
+            pad_len = (-size % 4)
+            self.raw(pad_len)
+        return data
+
+    def ranges(self) -> Sequence[Range]:
+        """Extract a range list"""
+        count = self.uint32()
+        ranges = [Range(index=index, count=count)
+                  for _ in range(count)
+                  for (index, count) in (self.unpack(UINT32x2),)]
+        return ranges
 
 
 @dataclass(kw_only=True)
@@ -85,9 +140,9 @@ class Encoder:
         """Encoded elements"""
         return (bytes(self.head), *self.tail)
 
-    def raw(self, element: Buffer, split=False) -> None:
-        """Prepend a raw element"""
-        memory = memoryview(element)
+    def raw(self, data: Buffer, split=False) -> None:
+        """Prepend raw data"""
+        memory = memoryview(data)
         length = memory.nbytes
         if length:
             if split:
@@ -105,18 +160,19 @@ class Encoder:
         """Prepend an unsigned 32-bit integer"""
         self.pack(UINT32, value)
 
-    def sized(self, element: Buffer, split=False) -> None:
+    def sized(self, data: Buffer, split=False) -> None:
         """Prepend a variably sized element
 
         The element will be zero-padded to a four-byte boundary if it
         is not the last element.
         """
-        length = memoryview(element).nbytes
+        size = memoryview(data).nbytes
         if self.length:
-            self.raw(bytes(-length % 4))
-        if length:
-            self.raw(element, split=split)
-        self.uint32(length)
+            pad_len = (-size % 4)
+            self.raw(bytes(pad_len))
+        if size:
+            self.raw(data, split=split)
+        self.uint32(size)
 
     def ranges(self, ranges: Sequence[Range]) -> None:
         """Prepend a range list"""
@@ -160,6 +216,33 @@ class Message:
         self.encode(encoder)
         return encoder.elements
 
+    @classmethod
+    def decoded(cls, data: Buffer) -> Message:
+        """Message decoded from a byte sequence"""
+        decoder = Decoder(data=memoryview(data))
+        return cls.decode(decoder)
+
+    @classmethod
+    def decode(cls, decoder: Decoder, **kwargs) -> Message:
+        """Decode message"""
+        remaining = decoder.remaining
+        (prot_ver, msg_type, length, crypto_alg_id) = decoder.unpack(UINT32x4)
+        if length != remaining:
+            raise DecodeError("message header length %d does not match %d" %
+                              (length, remaining))
+        if msg_type not in MsgType:
+            raise DecodeError("unrecognised message type %d" % msg_type)
+        subcls = cls._MSG_TYPES.get(MsgType(msg_type), None)
+        if subcls is None:
+            raise DecodeError("unregistered message type %d" % msg_type)
+        if subcls.PROT_VER != prot_ver:
+            raise DecodeError("protocol version %d is wrong for %s" %
+                              (prot_ver, subcls.__name__))
+        if crypto_alg_id not in CryptoAlgId:
+            raise DecodeError("unrecognised crypto algorithm %d" %
+                              crypto_alg_id)
+        return subcls.decode(decoder, crypto_alg_id=CryptoAlgId(crypto_alg_id))
+
     def encode(self, encoder: Encoder) -> None:
         """Encode message"""
         length = (encoder.length + UINT32x4.size)
@@ -175,6 +258,15 @@ class Request(Message):
 @dataclass(kw_only=True)
 class Response(Message):
     """Response message"""
+
+    @classmethod
+    def decode(cls, decoder: Decoder, **kwargs) -> Message:
+        """Decode message"""
+        length = decoder.uint32()
+        if length != decoder.remaining:
+            raise DecodeError("response header length %d does not match %d" %
+                              (length, decoder.remaining))
+        return super().decode(decoder)
 
     def encode(self, encoder: Encoder) -> None:
         """Encode message"""
@@ -196,12 +288,25 @@ class MsgGetBlks(Request):
     """Segment identifier"""
 
     req_block_ranges: Sequence[Range] = field(
-        default_factory=lambda: [Range(index=0, count=1)]
+        default_factory=lambda: [Range()]
     )
     """List of requested block ranges"""
 
     vrf: bytes = b''
     """Useless VRF data"""
+
+    @classmethod
+    def decode(cls, decoder: Decoder, **kwargs) -> MsgGetBlks:
+        """Decode message"""
+        segment_id = bytes(decoder.sized())
+        req_block_ranges = decoder.ranges()
+        vrf = bytes(decoder.sized())
+        return cls(
+            segment_id=segment_id,
+            req_block_ranges=req_block_ranges,
+            vrf=vrf,
+            **kwargs
+        )
 
     def encode(self, encoder: Encoder) -> None:
         """Encode message"""
@@ -238,6 +343,23 @@ class MsgBlk(Response):
 
     iv: bytes = b''
     """Initialization vector for block cipher"""
+
+    @classmethod
+    def decode(cls, decoder: Decoder, **kwargs) -> MsgBlk:
+        """Decode message"""
+        segment_id = bytes(decoder.sized())
+        (block_index, next_block_index) = decoder.unpack(UINT32x2)
+        block = decoder.sized()
+        vrf = bytes(decoder.sized())
+        iv = bytes(decoder.sized())
+        return cls(
+            segment_id=segment_id,
+            block_index=block_index,
+            block=block,
+            vrf=vrf,
+            iv=iv,
+            **kwargs
+        )
 
     def encode(self, encoder: Encoder) -> None:
         """Encode message"""
