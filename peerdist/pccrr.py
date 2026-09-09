@@ -12,11 +12,11 @@ entirely unrelated Discovery Protocol.)
 
 from __future__ import annotations
 
-from collections.abc import Buffer, Sequence
-from dataclasses import dataclass, field
+from collections.abc import Buffer, MutableMapping, Sequence
+from dataclasses import asdict, dataclass, field
 from enum import IntEnum
 from struct import Struct
-from typing import ClassVar
+from typing import ClassVar, Self
 
 
 UINT32 = Struct(">I")
@@ -82,16 +82,25 @@ class Decoder:
     """Position within original data"""
 
     @property
+    def len(self) -> int:
+        """Length of original data"""
+        return self.data.nbytes
+
+    @property
     def remaining(self) -> int:
         """Length of data remaining"""
-        return (self.data.nbytes - self.offset)
+        return (self.len - self.offset)
+
+    def reset(self) -> None:
+        """Reset decoder position"""
+        self.offset = 0
 
     def raw(self, length: int) -> memoryview:
         """Extract raw bytes"""
         offset = self.offset
         if length > self.remaining:
             raise DecodeError("too short for %d bytes at offset %d (of %d)" %
-                              (length, offset, self.data.nbytes))
+                              (length, offset, self.len))
         data = self.data[offset:(offset + length)].toreadonly()
         self.offset += length
         return data
@@ -108,16 +117,16 @@ class Decoder:
         """Extract a variably-sized element"""
         size = self.uint32()
         data = self.raw(size)
-        if self.offset < self.data.nbytes:
+        if self.offset < self.len:
             pad_len = (-size % 4)
             self.raw(pad_len)
         return data
 
     def ranges(self) -> Sequence[Range]:
         """Extract a range list"""
-        count = self.uint32()
+        num_ranges = self.uint32()
         ranges = [Range(index=index, count=count)
-                  for _ in range(count)
+                  for _ in range(num_ranges)
                   for (index, count) in (self.unpack(UINT32x2),)]
         return ranges
 
@@ -194,12 +203,12 @@ class Message:
     MSG_TYPE: ClassVar[MsgType]
     """Message type"""
 
-    _MSG_TYPES: ClassVar[dict[MsgType, type[Message]]] = {}
+    _MSG_TYPES: ClassVar[MutableMapping[MsgType, type[Self]]]
 
-    def __init_subclass__(cls, **kwargs) -> None:
+    def __init_subclass__(cls: type[Self], **kwargs) -> None:
         super().__init_subclass__(**kwargs)
         if getattr(cls, 'MSG_TYPE', None) is not None:
-            Message._MSG_TYPES[cls.MSG_TYPE] = cls
+            cls._MSG_TYPES[cls.MSG_TYPE] = cls
 
     def __bytes__(self) -> bytes:
         """Message encoded as a byte sequence"""
@@ -220,28 +229,50 @@ class Message:
     def decoded(cls, data: Buffer) -> Message:
         """Message decoded from a byte sequence"""
         decoder = Decoder(data=memoryview(data))
-        return cls.decode(decoder)
+        self = cls.decode(decoder)
+        return self
 
     @classmethod
-    def decode(cls, decoder: Decoder, **kwargs) -> Message:
-        """Decode message"""
+    def from_bytes(cls, data: Buffer) -> Message:
+        """Message autodetected and decoded from a byte sequence"""
+        decoder = Decoder(data=memoryview(data))
+        subcls = cls.autodetect(decoder)
+        decoder.reset()
+        return subcls.decode(decoder)
+
+    @classmethod
+    def autodetect(cls, decoder: Decoder) -> type[Self]:
+        """Autodetect message type"""
         remaining = decoder.remaining
         (prot_ver, msg_type, length, crypto_alg_id) = decoder.unpack(UINT32x4)
+        if msg_type not in MsgType:
+            raise DecodeError("unrecognised message type %d" % msg_type)
         if length != remaining:
             raise DecodeError("message header length %d does not match %d" %
                               (length, remaining))
-        if msg_type not in MsgType:
-            raise DecodeError("unrecognised message type %d" % msg_type)
         subcls = cls._MSG_TYPES.get(MsgType(msg_type), None)
         if subcls is None:
             raise DecodeError("unregistered message type %d" % msg_type)
-        if subcls.PROT_VER != prot_ver:
+        return subcls
+
+    @classmethod
+    def decode(cls, decoder: Decoder) -> Message:
+        """Decode message"""
+        remaining = decoder.remaining
+        (prot_ver, msg_type, length, crypto_alg_id) = decoder.unpack(UINT32x4)
+        if prot_ver != cls.PROT_VER:
             raise DecodeError("protocol version %d is wrong for %s" %
-                              (prot_ver, subcls.__name__))
+                              (prot_ver, cls.__name__))
+        if msg_type != cls.MSG_TYPE:
+            raise DecodeError("message type %d is wrong for %s" %
+                              (msg_type, cls.__name__))
+        if length != remaining:
+            raise DecodeError("message header length %d does not match %d" %
+                              (length, remaining))
         if crypto_alg_id not in CryptoAlgId:
             raise DecodeError("unrecognised crypto algorithm %d" %
                               crypto_alg_id)
-        return subcls.decode(decoder, crypto_alg_id=CryptoAlgId(crypto_alg_id))
+        return Message(crypto_alg_id=CryptoAlgId(crypto_alg_id))
 
     def encode(self, encoder: Encoder) -> None:
         """Encode message"""
@@ -254,13 +285,26 @@ class Message:
 class Request(Message):
     """Request message"""
 
+    _MSG_TYPES: ClassVar[MutableMapping[MsgType, type[Request]]] = {}
+
 
 @dataclass(kw_only=True)
 class Response(Message):
     """Response message"""
 
+    _MSG_TYPES: ClassVar[MutableMapping[MsgType, type[Response]]] = {}
+
     @classmethod
-    def decode(cls, decoder: Decoder, **kwargs) -> Message:
+    def autodetect(cls, decoder: Decoder) -> type[Self]:
+        """Autodetect message type"""
+        length = decoder.uint32()
+        if length != decoder.remaining:
+            raise DecodeError("response header length %d does not match %d" %
+                              (length, decoder.remaining))
+        return super().autodetect(decoder)
+
+    @classmethod
+    def decode(cls, decoder: Decoder) -> Message:
         """Decode message"""
         length = decoder.uint32()
         if length != decoder.remaining:
@@ -296,8 +340,9 @@ class MsgGetBlks(Request):
     """Useless VRF data"""
 
     @classmethod
-    def decode(cls, decoder: Decoder, **kwargs) -> MsgGetBlks:
+    def decode(cls, decoder: Decoder) -> Self:
         """Decode message"""
+        self = super().decode(decoder)
         segment_id = bytes(decoder.sized())
         req_block_ranges = decoder.ranges()
         vrf = bytes(decoder.sized())
@@ -305,7 +350,7 @@ class MsgGetBlks(Request):
             segment_id=segment_id,
             req_block_ranges=req_block_ranges,
             vrf=vrf,
-            **kwargs
+            **asdict(self)
         )
 
     def encode(self, encoder: Encoder) -> None:
@@ -345,8 +390,9 @@ class MsgBlk(Response):
     """Initialization vector for block cipher"""
 
     @classmethod
-    def decode(cls, decoder: Decoder, **kwargs) -> MsgBlk:
+    def decode(cls, decoder: Decoder) -> Self:
         """Decode message"""
+        self = super().decode(decoder)
         segment_id = bytes(decoder.sized())
         (block_index, next_block_index) = decoder.unpack(UINT32x2)
         block = decoder.sized()
@@ -355,10 +401,11 @@ class MsgBlk(Response):
         return cls(
             segment_id=segment_id,
             block_index=block_index,
+            next_block_index=next_block_index,
             block=block,
             vrf=vrf,
             iv=iv,
-            **kwargs
+            **asdict(self)
         )
 
     def encode(self, encoder: Encoder) -> None:
