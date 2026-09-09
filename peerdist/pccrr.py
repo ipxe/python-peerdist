@@ -114,7 +114,11 @@ class Decoder:
         return self.unpack(UINT32)[0]
 
     def sized(self) -> Buffer:
-        """Extract a variably-sized element"""
+        """Extract a variably-sized data block
+
+        Any zero-padding following the block will also be extracted,
+        unless it is at the end of the overall message.
+        """
         size = self.uint32()
         data = self.raw(size)
         if self.offset < self.len:
@@ -136,17 +140,17 @@ class Encoder:
     """Message encoder"""
 
     head: bytearray = field(default_factory=bytearray)
-    """First encoded element"""
+    """First buffer holding encoded message data"""
 
     tail: list[Buffer] = field(default_factory=list)
-    """Remaining encoded elements"""
+    """Remaining buffers holding encoded message data"""
 
     length: int = 0
-    """Total length of encoded elements"""
+    """Total length of encoded message data"""
 
     @property
-    def elements(self) -> Sequence[Buffer]:
-        """Encoded elements"""
+    def buffers(self) -> Sequence[Buffer]:
+        """List of buffers holding encoded message data"""
         return (bytes(self.head), *self.tail)
 
     def raw(self, data: Buffer, split=False) -> None:
@@ -170,10 +174,10 @@ class Encoder:
         self.pack(UINT32, value)
 
     def sized(self, data: Buffer, split=False) -> None:
-        """Prepend a variably sized element
+        """Prepend a variably sized data block
 
-        The element will be zero-padded to a four-byte boundary if it
-        is not the last element.
+        The block will be zero-padded to a four-byte boundary, unless
+        it is at the end of the overall message.
         """
         size = memoryview(data).nbytes
         if self.length:
@@ -208,17 +212,33 @@ class Message:
     def __init_subclass__(cls: type[Self], **kwargs) -> None:
         super().__init_subclass__(**kwargs)
         if getattr(cls, 'MSG_TYPE', None) is not None:
-            assert cls.MSG_TYPE not in cls._MSG_TYPES
+            if cls.MSG_TYPE in cls._MSG_TYPES:
+                raise RuntimeError("Duplicate message type %s vs %s" %
+                                   (cls, cls._MSG_TYPES[cls.MSG_TYPE]))
             cls._MSG_TYPES[cls.MSG_TYPE] = cls
 
     @classmethod
     def from_bytes(cls, data: Buffer) -> Message:
         """Message decoded from a byte sequence"""
-        return cls.decoded(data)
+        decoder = Decoder(data=memoryview(data))
+        if not hasattr(cls, 'MSG_TYPE'):
+            cls = cls.autodetect(decoder)
+            decoder.reset()
+        self = cls.decode(decoder)
+        if decoder.remaining:
+            raise DecodeError("unextracted bytes at offset %d (of %d)" %
+                              (decoder.offset, decoder.len))
+        return self
+
+    def to_buffers(self) -> Sequence[Buffer]:
+        """Message encoded as a buffer sequence"""
+        encoder = Encoder()
+        self.encode(encoder)
+        return encoder.buffers
 
     def to_bytes(self) -> bytes:
         """Message encoded as a byte sequence"""
-        return b''.join(self.encoded())
+        return b''.join(self.to_buffers())
 
     def __bytes__(self) -> bytes:
         """Message encoded as a byte sequence"""
@@ -227,25 +247,6 @@ class Message:
     def hex(self) -> str:
         """Message encoded as a hexadecimal string"""
         return bytes(self).hex()
-
-    def encoded(self) -> Sequence[Buffer]:
-        """Message encoded as a buffer sequence"""
-        encoder = Encoder()
-        self.encode(encoder)
-        return encoder.elements
-
-    @classmethod
-    def decoded(cls, data: Buffer) -> Message:
-        """Message decoded from a byte sequence"""
-        decoder = Decoder(data=memoryview(data))
-        if not hasattr(cls, 'MSG_TYPE'):
-            cls = cls.autodetect(decoder)
-            decoder.reset()
-        self = cls.decode(decoder)
-        if decoder.remaining:
-            raise DecodeError("trailing bytes at offset %d (of %d)" %
-                              (decoder.offset, decoder.len))
-        return self
 
     @classmethod
     def autodetect(cls, decoder: Decoder) -> type[Self]:
@@ -299,7 +300,7 @@ class Response(Message):
     @classmethod
     def autodetect(cls, decoder: Decoder) -> type[Self]:
         """Autodetect message type"""
-        length = decoder.uint32()
+        decoder.uint32()
         return super().autodetect(decoder)
 
     @classmethod
