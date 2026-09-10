@@ -71,10 +71,14 @@ class CacheKey:
     """File name suffix"""
 
     def __post_init__(self) -> None:
-        if not (isinstance(self.segment_id, bytes) and self.segment_id):
-            raise ValueError("Invalid segment ID %r" % self.segment_id)
-        if not (isinstance(self.block_index, int) and self.block_index >= 0):
-            raise ValueError("Invalid block index %r" % self.block_index)
+        if not isinstance(self.segment_id, bytes):
+            raise ValueError("Unexpected segment ID %r" % self.segment_id)
+        if not self.segment_id:
+            raise ValueError("Empty segment ID")
+        if not isinstance(self.block_index, int):
+            raise ValueError("Unexpected block index %r" % self.block_index)
+        if self.block_index < 0:
+            raise ValueError("Invalid block index %d" % self.block_index)
 
     @property
     def path(self) -> Path:
@@ -178,6 +182,7 @@ class CacheEntry:
                 index = 0
                 count = len(buffers)
                 while index < count:
+                    fh.flush()
                     written = os.writev(fh.fileno(), buffers[index:])
                     while index < count and written >= len(buffers[index]):
                         written -= len(buffers[index])
@@ -236,6 +241,10 @@ class Cache(Mapping[CacheKey, CacheEntry]):
         return sum(1 for _ in self)
 
 
+class BadRetrievalRequest(Exception):
+    """Bad cache retrieval request"""
+
+
 @dataclass
 class CacheServer:
     """Block replay cache server"""
@@ -257,10 +266,15 @@ class CacheServer:
         """
         segment_id = req.segment_id
         ranges = req.req_block_ranges
-        if len(ranges) != 1 or ranges[0].count != 1:
-            raise ValueError("Invalid retrieval range")
+        if len(ranges) != 1:
+            raise BadRetrievalRequest("Multiple block ranges")
+        if ranges[0].count != 1:
+            raise BadRetrievalRequest("Block range not for a single block")
         block_index = ranges[0].index
-        key = CacheKey(segment_id, block_index)
+        try:
+            key = CacheKey(segment_id, block_index)
+        except ValueError as exc:
+            raise BadRetrievalRequest(str(exc)) from exc
         with self.cache[key].reader() as fh:
             if fh is not None:
                 yield fh
