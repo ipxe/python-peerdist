@@ -49,7 +49,6 @@ from collections.abc import Iterator, Mapping
 from contextlib import contextmanager, ExitStack
 from dataclasses import dataclass
 import io
-import mmap
 import os
 from pathlib import Path
 import tempfile
@@ -167,8 +166,8 @@ class CacheEntry:
         with self.reader() as fh:
             if fh is None:
                 return None
-            with mmap.mmap(fh.fileno(), 0, prot=mmap.PROT_READ) as memory:
-                return pccrr.MsgBlk.from_bytes(memory)
+            msg = pccrr.MsgBlk.from_bytes(fh.read())
+        return msg
 
     @msg.setter
     def msg(self, msg: pccrr.MsgBlk | None) -> None:
@@ -209,9 +208,12 @@ class Cache(Mapping[CacheKey, CacheEntry]):
 
     def __contains__(self, key: object) -> bool:
         """Check if cache entry exists"""
-        return bool(self[key])
+        try:
+            return bool(self[key])
+        except KeyError:
+            return False
 
-    def __delitem__(self, key: CacheKey | tuple[bytes, int]) -> None:
+    def __delitem__(self, key: CacheKey) -> None:
         """Delete cache entry"""
         self[key].delete()
 
