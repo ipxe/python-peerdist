@@ -48,6 +48,7 @@ use cases:
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
+import os
 from pathlib import Path
 import tempfile
 from typing import cast, BinaryIO
@@ -81,36 +82,54 @@ class Cache(Mapping[CacheKey, Path]):
             return None
         try:
             key = (bytes.fromhex(segment_id_hex), int(block_index))
+            return key if cls.filename(key) == filename else None
         except ValueError:
             return None
-        return key if cls.filename(key) == filename else None
 
     @staticmethod
     def filename(key: CacheKey) -> str:
         """Construct cached block file name from cache key"""
         segment_id_hex = key[0].hex()
         if not segment_id_hex:
-            raise KeyError(key)
+            raise ValueError(key)
         block_index = int(key[1])
         if block_index < 0:
-            raise KeyError(key)
+            raise ValueError(key)
         return "%s-%d%s" % (segment_id_hex, block_index, SUFFIX)
 
     def filepath(self, key: CacheKey) -> Path:
         """Construct cached block file path from cache key"""
         filename = self.filename(key)
-        return self.path / filename[0:2] / filename
+        subdir = self.path / filename[0:2]
+        return subdir / filename
+
+    def fileglob(self, segment_id: bytes) -> Iterator[Path]:
+        """Construct cached block file glob from segment ID"""
+        segment_id_hex = segment_id.hex()
+        if not segment_id_hex:
+            raise ValueError(segment_id)
+        subdir = self.path / segment_id_hex[0:2]
+        return subdir.glob("%s-*%s" % (segment_id_hex, SUFFIX))
 
     def __getitem__(self, key: CacheKey) -> Path:
         """Get cached block file (if present in the cache)"""
-        path = self.filepath(key)
+        try:
+            path = self.filepath(key)
+        except ValueError:
+            raise KeyError(key)
         if not path.exists():
             raise KeyError(key)
         return path
 
     @contextmanager
-    def create(self, key: CacheKey) -> Iterator[BinaryIO]:
-        """Context manager for creating a cached block file"""
+    def create(self, key: CacheKey, sync=False) -> Iterator[BinaryIO]:
+        """Context manager for creating a cached block file
+
+        Returns a context for a temporary file into which the cached
+        block file content can be written.  On a clean exit, the
+        temporary file will be atomically renamed to appear under the
+        cache key.
+        """
         path = self.filepath(key)
         subdir = path.parent
         subdir.mkdir(exist_ok=True)
@@ -120,12 +139,17 @@ class Cache(Mapping[CacheKey, Path]):
                 delete_on_close=False,
         ) as tmp:
             yield cast(BinaryIO, tmp)
-            tmp.flush()
+            if sync:
+                tmp.flush()
+                os.fsync(tmp.fileno())
             Path(tmp.name).replace(path)
 
-    def __len__(self) -> int:
-        """Count cached block files"""
-        return sum(1 for _ in self)
+    def blocks(self, segment_id: bytes) -> Iterator[CacheKey]:
+        """Iterate over all cached block files within a segment"""
+        for path in self.fileglob(segment_id):
+            key = self.cachekey(path.name)
+            if key is not None and key[0] == segment_id:
+                yield key
 
     def __iter__(self) -> Iterator[CacheKey]:
         """Iterate over all cached block files"""
@@ -134,11 +158,6 @@ class Cache(Mapping[CacheKey, Path]):
             if key is not None:
                 yield key
 
-    def blocks(self, segment_id: bytes) -> Iterator[CacheKey]:
-        """Iterate over all cached block files within a segment"""
-        path = self.filepath((segment_id, 0))
-        glob = path.name.replace("-0", "-*") # "xxxxxxxx-0.blk"
-        for path in path.parent.glob(glob):
-            key = self.cachekey(path.name)
-            if key is not None and key[0] == segment_id:
-                yield key
+    def __len__(self) -> int:
+        """Count cached block files"""
+        return sum(1 for _ in self)
