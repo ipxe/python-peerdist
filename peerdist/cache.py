@@ -110,7 +110,7 @@ class CacheKey:
         return "%s/%s-*.%s" % (dirname, segment_id_str, cls.SUFFIX)
         
 
-@dataclass(frozen=True)
+@dataclass
 class CacheEntry:
     """Block replay cache entry"""
 
