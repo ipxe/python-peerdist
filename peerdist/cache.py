@@ -121,6 +121,10 @@ class CacheEntry:
         """Check if cache entry is present"""
         return self.path.exists()
 
+    def delete(self) -> None:
+        """Delete cache entry"""
+        self.path.unlink(missing_ok=True)
+
     @contextmanager
     def reader(self) -> Iterator[BinaryIO]:
         """Context manager for reading a cache entry
@@ -180,7 +184,7 @@ class CacheEntry:
                     if written:
                         buffers[index] = memoryview(buffers[index])[written:]
         else:
-            self.path.unlink(missing_ok=True)
+            self.delete()
 
 
 @dataclass
@@ -203,6 +207,10 @@ class Cache(Mapping[CacheKey, CacheEntry]):
         except ValueError:
             raise KeyError from None
         return CacheEntry(self.path / key.path)
+
+    def __delitem__(self, key: CacheKey | tuple[bytes, int]) -> None:
+        """Delete cache entry"""
+        self[key].delete()
 
     def blocks(self, segment_id: bytes) -> Iterator[CacheKey]:
         """Iterate over all cached block files within a segment"""
