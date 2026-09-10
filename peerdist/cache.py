@@ -48,7 +48,6 @@ use cases:
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager, ExitStack
 from dataclasses import dataclass
-import io
 import os
 from pathlib import Path
 import tempfile
@@ -239,49 +238,3 @@ class Cache(Mapping[CacheKey, CacheEntry]):
     def __len__(self) -> int:
         """Count cached block files"""
         return sum(1 for _ in self)
-
-
-class BadRetrievalRequest(Exception):
-    """Bad cache retrieval request"""
-
-
-@dataclass
-class CacheServer:
-    """Block replay cache server"""
-
-    cache: Cache
-    """Underlying block replay cache"""
-
-    @contextmanager
-    def retrieve(self, req: pccrr.MsgGetBlks) -> Iterator[BinaryIO]:
-        """Context manager for responding to a retrieval request
-
-        Returns a context yielding a file handle from which the
-        response bytes may be read.
-
-        The `MSG_GETBLKS` format allows for multiple blocks to be
-        requested, though the specification states that the requested
-        block ranges list must specify a single block range containing
-        only one block.
-        """
-        segment_id = req.segment_id
-        ranges = req.req_block_ranges
-        if len(ranges) != 1:
-            raise BadRetrievalRequest("Multiple block ranges")
-        if ranges[0].count != 1:
-            raise BadRetrievalRequest("Block range not for a single block")
-        block_index = ranges[0].index
-        try:
-            key = CacheKey(segment_id, block_index)
-        except ValueError as exc:
-            raise BadRetrievalRequest(str(exc)) from exc
-        with self.cache[key].reader() as fh:
-            if fh is not None:
-                yield fh
-            else:
-                missing = pccrr.MsgBlk(
-                    crypto_alg_id=req.crypto_alg_id,
-                    segment_id=segment_id,
-                    block_index=block_index,
-                )
-                yield io.BytesIO(missing.to_bytes())

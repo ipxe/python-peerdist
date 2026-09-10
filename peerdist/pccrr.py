@@ -19,6 +19,17 @@ from struct import Struct
 from typing import cast, ClassVar, Self, TypeVar
 
 
+MAGIC_PATH = "/116B50EB-ECE2-41ac-8429-9F9E963361B7/"
+"""Magic retrieval URI path
+
+This is the fixed HTTP URI path that clients use to send retrieval
+protocol requests.
+
+Yes, this is a mixed-case GUID used as string literal.  Nobody knows
+how or why this happened.
+"""
+
+
 UINT32 = Struct(">I")
 UINT32x2 = Struct(">2I")
 UINT32x4 = Struct(">4I")
