@@ -104,7 +104,7 @@ class Cache(Mapping[CacheKey, Path]):
         return subdir / filename
 
     def fileglob(self, segment_id: bytes) -> Iterator[Path]:
-        """Construct cached block file glob from segment ID"""
+        """Glob for cached block files for a segment ID"""
         segment_id_hex = segment_id.hex()
         if not segment_id_hex:
             raise ValueError(segment_id)
@@ -116,13 +116,13 @@ class Cache(Mapping[CacheKey, Path]):
         try:
             path = self.filepath(key)
         except ValueError:
-            raise KeyError(key)
+            raise KeyError(key) from None
         if not path.exists():
             raise KeyError(key)
         return path
 
     @contextmanager
-    def create(self, key: CacheKey, sync=False) -> Iterator[BinaryIO]:
+    def create(self, key: CacheKey, sync: bool = False) -> Iterator[BinaryIO]:
         """Context manager for creating a cached block file
 
         Returns a context for a temporary file into which the cached
@@ -139,8 +139,8 @@ class Cache(Mapping[CacheKey, Path]):
                 delete_on_close=False,
         ) as tmp:
             yield cast(BinaryIO, tmp)
+            tmp.flush()
             if sync:
-                tmp.flush()
                 os.fsync(tmp.fileno())
             Path(tmp.name).replace(path)
 
