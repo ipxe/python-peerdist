@@ -4,7 +4,7 @@ We implement a simple peer capable of responding to discovery and
 block retrieval requests, backed by an on-disk cache.
 """
 
-from collections.abc import Iterator
+from collections.abc import Buffer, Iterator
 from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass
 from functools import singledispatchmethod
@@ -12,51 +12,49 @@ import io
 from typing import BinaryIO
 
 from . import pccrr
-from . import cache
+from .cache import Cache, CacheKey
+
+
+RetrievalServerResponse = AbstractContextManager[BinaryIO]
 
 
 class BadRetrievalRequest(Exception):
     """Bad cache retrieval request"""
 
 
-@dataclass
-class Server:
-    """Peer server"""
+@dataclass(frozen=True)
+class RetrievalServer:
+    """Retrieval protocol server"""
 
-    cache: cache.Cache
+    cache: Cache
     """Underlying block replay cache"""
 
-    @singledispatchmethod
-    def respond(
-            self,
-            req: pccrr.Request | bytes,
-    ) -> AbstractContextManager[BinaryIO]:
-        """Context manager for responding to a request
+    def respond(self, body: Buffer) -> RetrievalServerResponse:
+        """Context manager for responding to a raw HTTP POST body
 
-        Returns a context yielding a file handle from which the
-        response bytes may be read.
-        """
-        raise BadRetrievalRequest("Unsupported request type")
-
-    @respond.register
-    def post(self, req: bytes) -> AbstractContextManager[BinaryIO]:
-        """Context manager for responding to a raw HTTP POST
-
-        Returns a context yielding a file handle from which the
+        Returns a context yielding a file-like object from which the
         response bytes may be read.
         """
         try:
-            msg = pccrr.Request.from_bytes(req)
+            req = pccrr.Request.from_bytes(body)
         except pccrr.DecodeError as exc:
             raise BadRetrievalRequest(str(exc)) from exc
-        return self.respond(msg)
+        return self.msg(req)
 
-    @respond.register
-    @contextmanager
-    def retrieve(self, req: pccrr.MsgGetBlks) -> Iterator[BinaryIO]:
-        """Context manager for responding to a retrieval request
+    @singledispatchmethod
+    def msg(self, req: pccrr.Request) -> RetrievalServerResponse:
+        """Context manager for responding to a retrieval protocol message
 
-        Returns a context yielding a file handle from which the
+        Returns a context yielding a file-like object from which the
+        response bytes may be read.
+        """
+        raise TypeError("Unsupported request type %s" % type(req).__name__)
+
+    @msg.register
+    def msg_getblks(self, req: pccrr.MsgGetBlks) -> RetrievalServerResponse:
+        """Context manager for responding to a MSG_GETBLKS request
+
+        Returns a context yielding a file-like object from which the
         response bytes may be read.
 
         The `MSG_GETBLKS` format allows for multiple blocks to be
@@ -72,16 +70,25 @@ class Server:
             raise BadRetrievalRequest("Block range not for a single block")
         block_index = ranges[0].index
         try:
-            key = cache.CacheKey(segment_id, block_index)
+            key = CacheKey(segment_id, block_index)
         except ValueError as exc:
             raise BadRetrievalRequest(str(exc)) from exc
+        return self.cached(key)
+
+    @contextmanager
+    def cached(self, key: CacheKey) -> Iterator[BinaryIO]:
+        """Context manager for returning a cache entry
+
+        Returns a context yielding a file-like object from which the
+        response bytes may be read.
+        """
         with self.cache[key].reader() as fh:
             if fh is not None:
                 yield fh
             else:
                 missing = pccrr.MsgBlk(
-                    crypto_alg_id=req.crypto_alg_id,
-                    segment_id=segment_id,
-                    block_index=block_index,
+                    crypto_alg_id=pccrr.CryptoAlgId.NONE,
+                    segment_id=key.segment_id,
+                    block_index=key.block_index,
                 )
                 yield io.BytesIO(missing.to_bytes())

@@ -110,7 +110,7 @@ class CacheKey:
         return "%s/%s-*.%s" % (dirname, segment_id_str, cls.SUFFIX)
         
 
-@dataclass
+@dataclass(frozen=True)
 class CacheEntry:
     """Block replay cache entry"""
 
@@ -129,9 +129,9 @@ class CacheEntry:
     def reader(self) -> Iterator[BinaryIO | None]:
         """Context manager for reading a cache entry
 
-        Returns a context yielding a file handle from which the cached
-        block file content can be read, or `None` if the cached block
-        file does not exist.
+        Returns a context yielding a file-like object from which the
+        cached block file content can be read, or `None` if the cached
+        block file does not exist.
         """
         with ExitStack() as stack:
             try:
