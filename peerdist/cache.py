@@ -46,7 +46,7 @@ use cases:
 """
 
 from collections.abc import Iterator, Mapping
-from contextlib import contextmanager
+from contextlib import contextmanager, ExitStack
 from dataclasses import dataclass
 import io
 import mmap
@@ -58,7 +58,7 @@ from typing import BinaryIO, cast, ClassVar, Self
 from . import pccrr
 
 
-@dataclass
+@dataclass(frozen=True)
 class CacheKey:
     """Block replay cache key"""
 
@@ -72,12 +72,10 @@ class CacheKey:
     """File name suffix"""
 
     def __post_init__(self) -> None:
-        segment_id = bytes(self.segment_id)
-        block_index = int(self.block_index)
-        if not segment_id or block_index < 0:
-            raise ValueError("Invalid cache key %s" % self)
-        self.segment_id = segment_id
-        self.block_index = block_index
+        if not (isinstance(self.segment_id, bytes) and self.segment_id):
+            raise ValueError("Invalid segment ID %r" % self.segment_id)
+        if not (isinstance(self.block_index, int) and self.block_index >= 0):
+            raise ValueError("Invalid block index %r" % self.block_index)
 
     @property
     def path(self) -> Path:
@@ -126,24 +124,29 @@ class CacheEntry:
         self.path.unlink(missing_ok=True)
 
     @contextmanager
-    def reader(self) -> Iterator[BinaryIO]:
+    def reader(self) -> Iterator[BinaryIO | None]:
         """Context manager for reading a cache entry
 
-        Returns a context for a file handle from which the cached
-        block file content can be read.  Raises `FileNotFoundError` if
-        the cached block file does not exist.
+        Returns a context yielding a file handle from which the cached
+        block file content can be read, or `None` if the cached block
+        file does not exist.
         """
-        with self.path.open(mode='rb') as fh:
-            yield fh
+        with ExitStack() as stack:
+            try:
+                fh = stack.enter_context(self.path.open(mode='rb'))
+            except FileNotFoundError:
+                yield None
+            else:
+                yield fh
 
     @contextmanager
     def writer(self, sync: bool = False) -> Iterator[BinaryIO]:
         """Context manager for creating a cache entry
 
-        Returns a context for a temporary file into which the cached
-        block file content can be written.  On a clean exit, the
-        temporary file will be atomically renamed to appear under the
-        cache key.
+        Returns a context yielding a temporary file into which the
+        cached block file content can be written.  On a clean exit,
+        the temporary file will be atomically renamed to appear under
+        the cache key.
         """
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with tempfile.NamedTemporaryFile(
@@ -161,12 +164,11 @@ class CacheEntry:
     @property
     def msg(self) -> pccrr.MsgBlk | None:
         """Block message content"""
-        try:
-            with self.reader() as fh:
-                with mmap.mmap(fh.fileno(), 0, prot=mmap.PROT_READ) as memory:
-                    return pccrr.MsgBlk.from_bytes(memory)
-        except FileNotFoundError:
-            return None
+        with self.reader() as fh:
+            if fh is None:
+                return None
+            with mmap.mmap(fh.fileno(), 0, prot=mmap.PROT_READ) as memory:
+                return pccrr.MsgBlk.from_bytes(memory)
 
     @msg.setter
     def msg(self, msg: pccrr.MsgBlk | None) -> None:
@@ -178,7 +180,7 @@ class CacheEntry:
                 count = len(buffers)
                 while index < count:
                     written = os.writev(fh.fileno(), buffers[index:])
-                    while written >= len(buffers[index]):
+                    while index < count and written >= len(buffers[index]):
                         written -= len(buffers[index])
                         index += 1
                     if written:
@@ -199,14 +201,15 @@ class Cache(Mapping[CacheKey, CacheEntry]):
         if not self.path.exists():
             raise ValueError("Cache directory %s does not exist" % self.path)
 
-    def __getitem__(self, key: CacheKey | tuple[bytes, int]) -> CacheEntry:
-        """Get cache entry"""
-        try:
-            if not isinstance(key, CacheKey):
-                key = CacheKey(key[0], key[1])
-        except ValueError:
-            raise KeyError from None
+    def __getitem__(self, key: object) -> CacheEntry:
+        """Get (possibly empty) cache entry"""
+        if not isinstance(key, CacheKey):
+            raise KeyError(key)
         return CacheEntry(self.path / key.path)
+
+    def __contains__(self, key: object) -> bool:
+        """Check if cache entry exists"""
+        return bool(self[key])
 
     def __delitem__(self, key: CacheKey | tuple[bytes, int]) -> None:
         """Delete cache entry"""
@@ -215,14 +218,14 @@ class Cache(Mapping[CacheKey, CacheEntry]):
     def blocks(self, segment_id: bytes) -> Iterator[CacheKey]:
         """Iterate over all cached block files within a segment"""
         for path in self.path.glob(CacheKey.glob(segment_id)):
-            key = CacheKey.from_path(path)
+            key = CacheKey.from_path(path.relative_to(self.path))
             if key is not None:
                 yield key
 
     def __iter__(self) -> Iterator[CacheKey]:
         """Iterate over all cached block files"""
         for path in self.path.glob(CacheKey.glob()):
-            key = CacheKey.from_path(path)
+            key = CacheKey.from_path(path.relative_to(self.path))
             if key is not None:
                 yield key
 
@@ -230,12 +233,25 @@ class Cache(Mapping[CacheKey, CacheEntry]):
         """Count cached block files"""
         return sum(1 for _ in self)
 
+
+@dataclass
+class CacheServer:
+    """Block replay cache server"""
+
+    cache: Cache
+    """Underlying block replay cache"""
+
     @contextmanager
     def retrieve(self, req: pccrr.MsgGetBlks) -> Iterator[BinaryIO]:
         """Context manager for responding to a retrieval request
 
-        Returns a context for a file handle from which the response
-        bytes may be read.
+        Returns a context yielding a file handle from which the
+        response bytes may be read.
+
+        The `MSG_GETBLKS` format allows for multiple blocks to be
+        requested, though the specification states that the requested
+        block ranges list must specify a single block range containing
+        only one block.
         """
         segment_id = req.segment_id
         ranges = req.req_block_ranges
@@ -243,14 +259,13 @@ class Cache(Mapping[CacheKey, CacheEntry]):
             raise ValueError("Invalid retrieval range")
         block_index = ranges[0].index
         key = CacheKey(segment_id, block_index)
-        entry = self[key]
-        try:
-            with entry.reader() as fh:
+        with self.cache[key].reader() as fh:
+            if fh is not None:
                 yield fh
-        except FileNotFoundError:
-            missing = pccrr.MsgBlk(
-                crypto_alg_id=req.crypto_alg_id,
-                segment_id=segment_id,
-                block_index=block_index,
-            )
-            yield io.BytesIO(missing.to_bytes())
+            else:
+                missing = pccrr.MsgBlk(
+                    crypto_alg_id=req.crypto_alg_id,
+                    segment_id=segment_id,
+                    block_index=block_index,
+                )
+                yield io.BytesIO(missing.to_bytes())
