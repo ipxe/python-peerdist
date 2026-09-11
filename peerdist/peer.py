@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from functools import singledispatchmethod
 import io
 import os
-from typing import BinaryIO
+from typing import BinaryIO, Self
 
 from . import pccrr
 from .cache import Cache, CacheKey
@@ -32,8 +32,8 @@ class RetrievalRequest:
 class RetrievalResponse:
     """Retrieval protocol response
 
-    Retrieval protocol responses may be large, and are represented as
-    an open file handle, to allow for the use of `sendfile()`.
+    Responses are represented as an opened file-like object to allow
+    for the use of `sendfile()`.
     """
 
     fh: BinaryIO
@@ -41,6 +41,20 @@ class RetrievalResponse:
 
     length: int
     """Response content length"""
+
+    @classmethod
+    def from_file(cls, fh: BinaryIO) -> Self:
+        """Construct retrieval protocol response from a file handle"""
+        length = (os.fstat(fh.fileno()).st_size - fh.tell())
+        return cls(fh=fh, length=length)
+
+    @classmethod
+    def from_message(cls, msg: pccrr.Message) -> Self:
+        """Construct retrieval protocol response from a message"""
+        data = msg.to_bytes()
+        fh = io.BytesIO(data)
+        length = len(data)
+        return cls(fh=fh, length=length)
 
 
 RetrievalResponseManager = AbstractContextManager[RetrievalResponse]
@@ -53,17 +67,17 @@ class RetrievalServer:
     cache: Cache
     """Underlying block replay cache"""
 
-    def respond(self, body: Buffer) -> RetrievalResponseManager:
-        """Context manager for responding to a raw HTTP POST body
+    def respond(self, req: RetrievalRequest) -> RetrievalResponseManager:
+        """Context manager for responding to a retrieval request
 
         Returns a context yielding a `RetrievalResponse` from which
         the response bytes may be read.
         """
         try:
-            req = pccrr.Request.from_bytes(body)
+            msg = pccrr.Request.from_bytes(req.data)
         except pccrr.DecodeError as exc:
             raise BadRetrievalRequest(str(exc)) from exc
-        return self.msg(req)
+        return self.msg(msg)
 
     @singledispatchmethod
     def msg(self, req: pccrr.Request) -> RetrievalResponseManager:
@@ -107,14 +121,12 @@ class RetrievalServer:
         the response bytes may be read.
         """
         with self.cache[key].reader() as fh:
-            if fh is None:
+            if fh is not None:
+                yield RetrievalResponse.from_file(fh)
+            else:
                 missing = pccrr.MsgBlk(
                     crypto_alg_id=pccrr.CryptoAlgId.NONE,
                     segment_id=key.segment_id,
                     block_index=key.block_index,
-                ).to_bytes()
-                fh = io.BytesIO(missing)
-                length = len(missing)
-            else:
-                length = os.fstat(fh.fileno()).st_size
-            yield RetrievalResponse(fh=fh, length=length)
+                )
+                yield RetrievalResponse.from_message(missing)
