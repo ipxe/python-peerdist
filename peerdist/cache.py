@@ -90,7 +90,7 @@ class CacheKey:
     def path(self) -> Path:
         """Path for this cache key"""
         filename = "%s-%d.%s" % (self.segment_id.hex(), self.block_index,
-                                self.SUFFIX)
+                                 self.SUFFIX)
         dirname = filename[:2]
         return Path(dirname) / Path(filename)
 

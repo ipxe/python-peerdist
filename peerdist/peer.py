@@ -5,7 +5,7 @@ block retrieval requests, backed by an on-disk cache.
 """
 
 import asyncio
-from collections.abc import Buffer, Iterator, Sequence
+from collections.abc import Buffer, Iterator, Mapping, Sequence
 from contextlib import AbstractContextManager, contextmanager, ExitStack
 from contextvars import ContextVar
 from dataclasses import dataclass, field, InitVar
@@ -44,9 +44,11 @@ logger.addFilter(LogFilter())
 class HttpError(Exception):
     """HTTP error response"""
 
-    def __init__(self, status: http.HTTPStatus) -> None:
+    def __init__(self, status: http.HTTPStatus,
+                 headers: Mapping[str, str] | None = None) -> None:
         super().__init__(status.phrase)
         self.status = status
+        self.headers = headers or {}
 
 
 class BadRetrievalRequest(Exception):
@@ -283,7 +285,6 @@ class StandaloneRetrievalServer:
         Returns `True` iff the connection may be kept alive.
         """
         # Prepare response headers
-        rspheaders = http.client.HTTPMessage(policy=email.policy.HTTP)
         # Receive request
         try:
             # Read until end of headers
@@ -298,9 +299,9 @@ class StandaloneRetrievalServer:
                 except (UnicodeDecodeError, ValueError):
                     raise HttpError(http.HTTPStatus.BAD_REQUEST) from None
                 # Parse request headers and body
-                reqheaders = http.client.parse_headers(io.BytesIO(rest))
+                headers = http.client.parse_headers(io.BytesIO(rest))
                 try:
-                    length = int(reqheaders["Content-Length"])
+                    length = int(headers["Content-Length"])
                 except (TypeError, ValueError):
                     raise HttpError(http.HTTPStatus.LENGTH_REQUIRED) from None
                 if not 0 <= length <= self.MAX_REQUEST_LEN:
@@ -310,32 +311,35 @@ class StandaloneRetrievalServer:
                 if path.lower() != pccrr.MAGIC_PATH.lower():
                     raise HttpError(http.HTTPStatus.NOT_FOUND)
                 if method != "POST":
-                    rspheaders["Allow"] = "POST"
-                    raise HttpError(http.HTTPStatus.METHOD_NOT_ALLOWED)
+                    raise HttpError(http.HTTPStatus.METHOD_NOT_ALLOWED,
+                                    {"Allow": "POST"})
         except asyncio.LimitOverrunError:
-            status = http.HTTPStatus.REQUEST_HEADER_FIELDS_TOO_LARGE
-            return await self.error(writer, status, rspheaders)
+            err = HttpError(http.HTTPStatus.REQUEST_HEADER_FIELDS_TOO_LARGE)
+            return await self.error(writer, err)
         except TimeoutError:
-            status = http.HTTPStatus.REQUEST_TIMEOUT
-            return await self.error(writer, status, rspheaders)
+            err = HttpError(http.HTTPStatus.REQUEST_TIMEOUT)
+            return await self.error(writer, err)
         except HttpError as exc:
-            return await self.error(writer, exc.status, rspheaders)
+            return await self.error(writer, exc)
         # Parse request and send response
         with ExitStack() as stack:
             # Generate response
             try:
                 rsp = stack.enter_context(self.server.respond(req))
             except BadRetrievalRequest:
-                status = http.HTTPStatus.BAD_REQUEST
-                return await self.error(writer, status, rspheaders)
+                err = HttpError(http.HTTPStatus.BAD_REQUEST)
+                return await self.error(writer, err)
             except Exception:
                 logger.exception("Could not construct retrieval response")
-                status = http.HTTPStatus.INTERNAL_SERVER_ERROR
-                return await self.error(writer, status, rspheaders)
+                err = HttpError(http.HTTPStatus.INTERNAL_SERVER_ERROR)
+                return await self.error(writer, err)
             # Send response
-            rspheaders["Content-Length"] = str(rsp.length)
-            rspheaders["Connection"] = "keep-alive"
-            writer.write(b"HTTP/1.1 200 OK\r\n" + bytes(rspheaders))
+            writer.write(
+                b"HTTP/1.1 200 OK\r\n"
+                b"Content-Length: %d\r\n"
+                b"Connection: keep-alive\r\n"
+                % rsp.length
+            )
             match rsp:
                 case RetrievalBufferResponse(buffers=buffers):
                     for buf in buffers:
@@ -350,15 +354,18 @@ class StandaloneRetrievalServer:
         return True
 
     @staticmethod
-    async def error(writer: asyncio.StreamWriter,
-                    status: http.HTTPStatus,
-                    headers: http.client.HTTPMessage) -> bool:
+    async def error(writer: asyncio.StreamWriter, exc: HttpError) -> bool:
         """Send an HTTP error response"""
-        headers["Content-Length"] = "0"
-        headers["Connection"] = "close"
+        status = exc.status
+        headers = http.client.HTTPMessage(policy=email.policy.HTTP)
+        for k, v in exc.headers.items():
+            headers[k] = v
         writer.write(
-            b"HTTP/1.1 %d %s\r\n%s" %
-            (status.value, status.phrase.encode(), bytes(headers))
+            b"HTTP/1.1 %d %s\r\n"
+            b"Content-Length: 0\r\n"
+            b"Connection: close\r\n"
+            b"%s"
+            % (status.value, status.phrase.encode(), bytes(headers))
         )
         await writer.drain()
         return False
