@@ -16,7 +16,7 @@ from collections.abc import Buffer, MutableMapping, Sequence
 from dataclasses import dataclass, field
 from enum import IntEnum
 from struct import Struct
-from typing import cast, ClassVar, Self, TypeVar
+from typing import Any, cast, ClassVar, Self, TypeVar
 
 
 MAGIC_PATH = "/116B50EB-ECE2-41ac-8429-9F9E963361B7/"
@@ -164,7 +164,7 @@ class Encoder:
         """List of buffers holding encoded message data"""
         return (bytes(self.head), *self.tail)
 
-    def raw(self, data: Buffer, split=False) -> None:
+    def raw(self, data: Buffer, split: bool = False) -> None:
         """Prepend raw data"""
         memory = memoryview(data)
         length = memory.nbytes
@@ -184,7 +184,7 @@ class Encoder:
         """Prepend an unsigned 32-bit integer"""
         self.pack(UINT32, value)
 
-    def sized(self, data: Buffer, split=False) -> None:
+    def sized(self, data: Buffer, split: bool = False) -> None:
         """Prepend a variably sized data block
 
         The block will be zero-padded to a four-byte boundary, unless
@@ -223,7 +223,7 @@ class Message:
 
     _MSG_TYPES: ClassVar[MutableMapping[MsgType, type[Self]]] = {}
 
-    def __init_subclass__(cls: type[Self], **kwargs) -> None:
+    def __init_subclass__(cls: type[Self], **kwargs: Any) -> None:
         super().__init_subclass__(**kwargs)
         if getattr(cls, 'MSG_TYPE', None) is not None:
             if cls.MSG_TYPE in cls._MSG_TYPES:

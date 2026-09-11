@@ -69,7 +69,7 @@ class CacheKey:
     SUFFIX: ClassVar[str] = "blk"
     """File name suffix"""
 
-    MAX_SEGMENT_ID_LEN = 64
+    MAX_SEGMENT_ID_LEN: ClassVar[int] = 64
     """Maximum length of a segment identifier"""
 
     def __post_init__(self) -> None:
@@ -92,7 +92,7 @@ class CacheKey:
         return Path(dirname) / Path(filename)
 
     @classmethod
-    def from_path(cls, path: os.PathLike | str) -> Self | None:
+    def from_path(cls, path: os.PathLike[str] | str) -> Self | None:
         """Construct cache key matching a path"""
         path = Path(path)
         (segment_id_str, _, block_index_str) = path.stem.rpartition('-')
@@ -200,13 +200,13 @@ class CacheEntry:
 class Cache(Mapping[CacheKey, CacheEntry]):
     """Block replay cache"""
 
-    dirname: InitVar[os.PathLike | str]
+    dirname: InitVar[os.PathLike[str] | str]
     """Cache directory"""
 
     path: Path = field(init=False)
     """Cache directory (as a path object)"""
 
-    def __post_init__(self, dirname: os.PathLike | str) -> None:
+    def __post_init__(self, dirname: os.PathLike[str] | str) -> None:
         self.path = Path(dirname)
         if not self.path.exists():
             raise ValueError("Cache directory %s does not exist" % self.path)

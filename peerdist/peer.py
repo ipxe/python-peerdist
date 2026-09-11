@@ -7,6 +7,7 @@ block retrieval requests, backed by an on-disk cache.
 import asyncio
 from collections.abc import Buffer, Iterator, Sequence
 from contextlib import AbstractContextManager, contextmanager, ExitStack
+from contextvars import ContextVar
 from dataclasses import dataclass, field, InitVar
 from functools import singledispatchmethod
 import http.client
@@ -19,7 +20,22 @@ from . import pccrr
 from .cache import Cache, CacheKey
 
 
+ctx_peername: ContextVar[str | None] = ContextVar("peername", default=None)
+
+
+class LogFilter(logging.Filter):
+    """Log message filter"""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        """Add current peer name to log messages (if applicable)"""
+        peername = ctx_peername.get()
+        if peername is not None:
+            record.name = "%s[%s]" % (record.name, peername)
+        return True
+
+
 logger = logging.getLogger(__name__)
+logger.addFilter(LogFilter())
 
 
 class BadRetrievalRequest(Exception):
@@ -227,20 +243,19 @@ class StandaloneRetrievalServer:
         This may be used as the `connected_cb` callback handler for
         use with `asyncio.start_server`.
         """
-        peername = writer.get_extra_info("peername")[0]
-        logger.debug("%s: connected" % peername)
         try:
-            while await self.respond(peername, reader, writer):
+            ctx_peername.set(writer.get_extra_info("peername")[0])
+            logger.debug("connected")
+            while await self.handle(reader, writer):
                 pass
-        except (asyncio.IncompleteReadError, ConnectionResetError):
+        except (asyncio.IncompleteReadError, ConnectionError):
             pass
         finally:
             writer.close()
-            logger.debug("%s: disconnected" % peername)
+            logger.debug("disconnected")
 
-    async def respond(
+    async def handle(
             self,
-            peername: str,
             reader: asyncio.StreamReader,
             writer: asyncio.StreamWriter
     ) -> bool:
@@ -264,24 +279,23 @@ class StandaloneRetrievalServer:
         try:
             length = int(headers["Content-Length"])
         except (TypeError, ValueError):
-            return await self.respond_error(writer, 411, b"Length Required")
+            return await self.error(writer, 411, b"Length Required")
         if not 0 <= length <= self.MAX_RETRIEVAL_REQUEST:
-            return await self.respond_error(writer, 413, b"Payload Too Large")
+            return await self.error(writer, 413, b"Payload Too Large")
         req = await reader.readexactly(length)
         # Check request parameters
         if method != "POST" or path.lower() != pccrr.MAGIC_PATH.lower():
-            return await self.respond_error(writer, 404, b"Not Found")
+            return await self.error(writer, 404, b"Not Found")
         # Parse request and send response
         with ExitStack() as stack:
             # Generate response
             try:
                 rsp = stack.enter_context(self.server.respond(req))
             except BadRetrievalRequest:
-                return await self.respond_error(writer, 400, b"Bad Request")
+                return await self.error(writer, 400, b"Bad Request")
             except Exception:
                 logger.exception("Could not construct retrieval response")
-                return await self.respond_error(writer, 500,
-                                                b"Internal Server Error")
+                return await self.error(writer, 500, b"Internal Server Error")
             # Send response
             writer.write(
                 b"HTTP/1.1 200 OK\r\n"
@@ -304,8 +318,8 @@ class StandaloneRetrievalServer:
         return True
 
     @staticmethod
-    async def respond_error(writer: asyncio.StreamWriter, status: int,
-                            reason: bytes) -> bool:
+    async def error(writer: asyncio.StreamWriter, status: int,
+                    reason: bytes) -> bool:
         """Send an HTTP error response"""
         writer.write(
             b"HTTP/1.1 %d %s\r\n"
