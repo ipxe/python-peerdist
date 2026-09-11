@@ -45,10 +45,10 @@ class HttpError(Exception):
     """HTTP error response"""
 
     def __init__(self, status: http.HTTPStatus,
-                 headers: Mapping[str, str] | None = None) -> None:
+                 extra_headers: Mapping[str, str] | None = None) -> None:
         super().__init__(status.phrase)
         self.status = status
-        self.headers = headers or {}
+        self.extra_headers = extra_headers
 
 
 class BadRetrievalRequest(Exception):
@@ -338,6 +338,7 @@ class StandaloneRetrievalServer:
                 b"HTTP/1.1 200 OK\r\n"
                 b"Content-Length: %d\r\n"
                 b"Connection: keep-alive\r\n"
+                b"\r\n"
                 % rsp.length
             )
             match rsp:
@@ -357,15 +358,19 @@ class StandaloneRetrievalServer:
     async def error(writer: asyncio.StreamWriter, exc: HttpError) -> bool:
         """Send an HTTP error response"""
         status = exc.status
-        headers = http.client.HTTPMessage(policy=email.policy.HTTP)
-        for k, v in exc.headers.items():
-            headers[k] = v
+        if exc.extra_headers is not None:
+            extra_headers = http.client.HTTPMessage(policy=email.policy.HTTP)
+            for k, v in exc.extra_headers.items():
+                extra_headers[k] = v
+            end = bytes(extra_headers)
+        else:
+            end = b"\r\n"
         writer.write(
             b"HTTP/1.1 %d %s\r\n"
             b"Content-Length: 0\r\n"
             b"Connection: close\r\n"
             b"%s"
-            % (status.value, status.phrase.encode(), bytes(headers))
+            % (status.value, status.phrase.encode(), end)
         )
         await writer.drain()
         return False
