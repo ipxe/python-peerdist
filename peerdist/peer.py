@@ -27,10 +27,11 @@ class LogFilter(logging.Filter):
     """Log message filter"""
 
     def filter(self, record: logging.LogRecord) -> bool:
-        """Add current peer name to log messages (if applicable)"""
+        """Add current peer name to log record name (if applicable)"""
         peername = ctx_peername.get()
         if peername is not None:
-            record.name = "%s[%s]" % (record.name, peername)
+            if isinstance(peername, tuple):
+                record.name = "%s[%s]" % (record.name, peername[0])
         return True
 
 
@@ -243,8 +244,8 @@ class StandaloneRetrievalServer:
         This may be used as the `connected_cb` callback handler for
         use with `asyncio.start_server`.
         """
+        ctx_peername.set(writer.get_extra_info("peername"))
         try:
-            ctx_peername.set(writer.get_extra_info("peername")[0])
             logger.debug("connected")
             while await self.handle(reader, writer):
                 pass
