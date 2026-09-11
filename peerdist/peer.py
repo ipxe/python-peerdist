@@ -299,7 +299,7 @@ class StandaloneRetrievalServer:
                 except (TypeError, ValueError):
                     raise HttpError(http.HTTPStatus.LENGTH_REQUIRED)
                 if not 0 <= length <= self.MAX_REQUEST_LEN:
-                    raise HttpError(http.HTTPStatus.CONTENT_TOO_LARGE)
+                    raise HttpError(http.HTTPStatus.REQUEST_ENTITY_TOO_LARGE)
                 req = await reader.readexactly(length)
                 # Check request parameters
                 if method != "POST":
