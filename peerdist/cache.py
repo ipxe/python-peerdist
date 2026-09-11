@@ -108,7 +108,7 @@ class CacheKey:
             raise ValueError("Invalid segment ID %r" % segment_id)
         dirname = segment_id_str[:2]
         return "%s/%s-*.%s" % (dirname, segment_id_str, cls.SUFFIX)
-        
+
 
 @dataclass
 class CacheEntry:
