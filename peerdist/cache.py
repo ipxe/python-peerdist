@@ -47,7 +47,7 @@ use cases:
 
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager, ExitStack
-from dataclasses import dataclass
+from dataclasses import dataclass, field, InitVar
 import os
 from pathlib import Path
 import tempfile
@@ -69,11 +69,15 @@ class CacheKey:
     SUFFIX: ClassVar[str] = "blk"
     """File name suffix"""
 
+    MAX_SEGMENT_ID_LEN = 64
+    """Maximum length of a segment identifier"""
+
     def __post_init__(self) -> None:
         if not isinstance(self.segment_id, bytes):
             raise ValueError("Unexpected segment ID %r" % self.segment_id)
-        if not self.segment_id:
-            raise ValueError("Empty segment ID")
+        if not 0 < len(self.segment_id) <= self.MAX_SEGMENT_ID_LEN:
+            raise ValueError("Invalid segment ID length %d" %
+                             len(self.segment_id))
         if not isinstance(self.block_index, int):
             raise ValueError("Unexpected block index %r" % self.block_index)
         if self.block_index < 0:
@@ -196,11 +200,14 @@ class CacheEntry:
 class Cache(Mapping[CacheKey, CacheEntry]):
     """Block replay cache"""
 
-    path: Path
+    dirname: InitVar[os.PathLike | str]
     """Cache directory"""
 
-    def __post_init__(self) -> None:
-        self.path = Path(self.path)
+    path: Path = field(init=False)
+    """Cache directory (as a path object)"""
+
+    def __post_init__(self, dirname: os.PathLike | str) -> None:
+        self.path = Path(dirname)
         if not self.path.exists():
             raise ValueError("Cache directory %s does not exist" % self.path)
 
