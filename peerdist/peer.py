@@ -75,8 +75,8 @@ class RetrievalServer:
     """Retrieval protocol server
 
     The retrieval protocol server is fundamentally transport-agnostic:
-    a raw HTTP POST request body can be passed to the `respond` method
-    to obtain the appropriate response body.
+    a raw HTTP POST request body can be passed to the `response`
+    method to obtain the appropriate response body.
 
     The most efficient way to send the response body is to use
     `sendfile`, to avoid unnecessarily copying the cached block file
@@ -85,15 +85,15 @@ class RetrievalServer:
     protocol operates over HTTP rather than HTTPS, so `sendfile` is a
     perfect match for this use case.
 
-    To facilitate this, the `respond` method acts as a context manager
-    that yields either a `RetrievalBufferResponse` (representing a
-    short response already in memory) or a `RetrievalFileResponse`
-    (representing an opened read-only file handle).  The caller should
-    `match` the returned type and then either transmit the buffers or
-    call `sendfile` accordingly:
+    To facilitate this, the `response` method acts as a context
+    manager that yields either a `RetrievalBufferResponse`
+    (representing a short response already in memory) or a
+    `RetrievalFileResponse` (representing an opened read-only file
+    handle).  The caller should `match` the returned type and then
+    either transmit the buffers or call `sendfile` accordingly:
 
         try:
-            rspmanager = retrieval_server.respond(req)
+            rspmanager = retrieval_server.response(req)
         except peerdist.peer.BadRetrievalRequest:
             ... report client error ...
         with rspmanager as rsp:
@@ -106,20 +106,15 @@ class RetrievalServer:
 
     The file handle will be automatically closed on exit from the context.
 
-    The `respond` method is non-blocking and can therefore be used in
+    The `response` method is non-blocking and can therefore be used in
     any synchronous or asynchronous server framework.
-
-    The `connected` method may be used as the callback for
-    `asyncio.start_server` to implement a standalone retrieval
-    protocol server, in the absence of any higher-level server
-    framework.
     """
 
     cache: Cache
     """Underlying block replay cache"""
 
-    def respond(self, req: Buffer) -> RetrievalResponseManager:
-        """Context manager for responding to a retrieval request
+    def response(self, req: Buffer) -> RetrievalResponseManager:
+        """Context manager for a response to a retrieval request
 
         Returns a context yielding a `RetrievalResponse` from which
         the response bytes may be read.
@@ -132,16 +127,18 @@ class RetrievalServer:
 
     @singledispatchmethod
     def msg(self, msg: pccrr.Request) -> RetrievalResponseManager:
-        """Context manager for responding to a retrieval protocol message
+        """Context manager for a response to a retrieval request
 
         Returns a context yielding a `RetrievalResponse` from which
         the response bytes may be read.
         """
-        raise TypeError("Unsupported request type %s" % type(msg).__name__)
+        raise BadRetrievalRequest(
+            "Unsupported request type %s" % type(msg).__name__
+        )
 
     @msg.register
     def msg_getblks(self, msg: pccrr.MsgGetBlks) -> RetrievalResponseManager:
-        """Context manager for responding to a MSG_GETBLKS request
+        """Context manager for a response to a MSG_GETBLKS request
 
         Returns a context yielding a `RetrievalResponse` from which
         the response bytes may be read.
@@ -166,14 +163,14 @@ class RetrievalServer:
 
     @contextmanager
     def cached(self, key: CacheKey) -> Iterator[RetrievalResponse]:
-        """Context manager for returning a cache entry
+        """Context manager for a response representing a cache entry
 
         Returns a context yielding a `RetrievalResponse` from which
         the response bytes may be read.
         """
         with self.cache[key].reader() as fh:
             if fh is not None:
-                length = (os.fstat(fh.fileno()).st_size - fh.tell())
+                length = os.fstat(fh.fileno()).st_size
                 yield RetrievalFileResponse(fh=fh, length=length)
             else:
                 missing = pccrr.MsgBlk(
@@ -184,22 +181,44 @@ class RetrievalServer:
                 buffers = missing.to_buffers()
                 yield RetrievalBufferResponse(buffers=buffers)
 
+
+@dataclass(frozen=True)
+class StandaloneRetrievalServer(RetrievalServer):
+    """Standalone retrieval protocol server
+
+    If you are hosting the retrieval protocol server within a
+    higher-level web framework such as aiohttp, Werkzeug, Flask, etc,
+    then ignore this class and instead register a route for
+    `pccrr.MAGIC_PATH` that calls `RetrievalServer.response` to obtain
+    the response.
+    """
+
     async def connected(
+            self,
+            reader: asyncio.StreamReader,
+            writer: asyncio.StreamWriter
+    ) -> None:
+        """Handle a standalone server connection
+
+        This may be used as the `connected_cb` callback handler for
+        use with `asyncio.start_server`.
+        """
+        try:
+            while await self.respond(reader, writer):
+                pass
+        except (asyncio.IncompleteReadError, ConnectionResetError):
+            pass
+        finally:
+            writer.close()
+
+    async def respond(
             self,
             reader: asyncio.StreamReader,
             writer: asyncio.StreamWriter
     ) -> bool:
         """Handle a standalone server request
 
-        This may be used as the callback handler for use with
-        `asyncio.start_server` to implement a standalone retrieval
-        protocol server (including HTTP header parsing).
-
-        If you are hosting the retrieval protocol server within a
-        higher-level web framework such as aiohttp, Werkzeug, Flask,
-        etc, then ignore this method and instead register a route for
-        `pccrr.MAGIC_PATH` that calls `RetrievalServer.respond` to
-        obtain the response.
+        Returns `True` iff the connection may be kept alive.
         """
         try:
             head = await reader.readuntil(b"\r\n\r\n")
@@ -214,16 +233,16 @@ class RetrievalServer:
         try:
             length = int(headers["Content-Length"])
         except (TypeError, ValueError):
-            return await self._http_error(writer, 411, b"Length Required")
+            return await self.respond_error(writer, 411, b"Length Required")
         if not 0 <= length <= MAX_RETRIEVAL_REQUEST:
-            return await self._http_error(writer, 413, b"Payload Too Large")
+            return await self.respond_error(writer, 413, b"Payload Too Large")
         req = await reader.readexactly(length)
         if method != "POST" or path.lower() != pccrr.MAGIC_PATH.lower():
-            return await self._http_error(writer, 404, b"Not Found")
+            return await self.respond_error(writer, 404, b"Not Found")
         try:
-            rspmanager = self.respond(req)
+            rspmanager = self.response(req)
         except BadRetrievalRequest:
-            return await self._http_error(writer, 400, b"Bad Request")
+            return await self.respond_error(writer, 400, b"Bad Request")
         with rspmanager as rsp:
             writer.write(
                 b"HTTP/1.1 200 OK\r\n"
@@ -246,8 +265,8 @@ class RetrievalServer:
         return True
 
     @staticmethod
-    async def _http_error(writer: asyncio.StreamWriter, status: int,
-                          reason: bytes) -> bool:
+    async def respond_error(writer: asyncio.StreamWriter, status: int,
+                            reason: bytes) -> bool:
         """Send an HTTP error response and close the connection"""
         writer.write(
             b"HTTP/1.1 %d %s\r\n"
@@ -258,3 +277,7 @@ class RetrievalServer:
         )
         await writer.drain()
         return False
+
+    async def start_server(self, *args, **kwargs) -> asyncio.Server:
+        """Start standalone server"""
+        return await asyncio.start_server(self.connected, *args, **kwargs)
