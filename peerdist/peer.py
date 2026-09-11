@@ -12,10 +12,14 @@ from functools import singledispatchmethod
 import http.client
 import io
 import os
-from typing import assert_never, BinaryIO, ClassVar, TypeAlias
+from typing import assert_never, BinaryIO, TypeAlias
 
 from . import pccrr
 from .cache import Cache, CacheKey
+
+
+MAX_RETRIEVAL_REQUEST = 65536
+"""Maximum retrieval protocol request size (including headers)"""
 
 
 class BadRetrievalRequest(Exception):
@@ -139,33 +143,22 @@ class RetrievalServer:
                 buffers = missing.to_buffers()
                 yield RetrievalBufferResponse(buffers=buffers)
 
-
-@dataclass(frozen=True)
-class RetrievalAsyncIoServer(RetrievalServer):
-    """Retrieval protocol server using asyncio
-
-    This may be used to provide the callback handler for use with
-    `asyncio.start_server` to handle a complete retrieval protocol
-    request (including parsing and constructing the HTTP headers).
-
-    If you are hosting the retrieval protocol server within a
-    higher-level web framework such as Flask or aiohttp then ignore
-    this and instead register a route for `pccrr.MAGIC_PATH` that
-    calls `RetrievalServer.respond` to obtain the response.
-    """
-
-    MAX_REQUEST: ClassVar[int] = 65536
-    """Maximum request size (including headers)"""
-
     async def connected(
             self,
             reader: asyncio.StreamReader,
             writer: asyncio.StreamWriter
     ) -> bool:
-        """Handle a single server request
+        """Handle a standalone server request
 
-        This may be used as the callback handler for
-        `asyncio.start_server()`.
+        This may be used as the callback handler for use with
+        `asyncio.start_server` to implement a standalone retrieval
+        protocol server (including HTTP header parsing).
+
+        If you are hosting the retrieval protocol server within a
+        higher-level web framework such as aiohttp, Werkzeug, Flask,
+        etc, then ignore this method and instead register a route for
+        `pccrr.MAGIC_PATH` that calls `RetrievalServer.respond` to
+        obtain the response.
         """
         try:
             head = await reader.readuntil(b"\r\n\r\n")
@@ -180,16 +173,16 @@ class RetrievalAsyncIoServer(RetrievalServer):
         try:
             length = int(headers["Content-Length"])
         except (TypeError, ValueError):
-            return await self.http_error(writer, 411, b"Length Required")
-        if not 0 <= length <= self.MAX_REQUEST:
-            return await self.http_error(writer, 413, b"Payload Too Large")
+            return await self._http_error(writer, 411, b"Length Required")
+        if not 0 <= length <= MAX_RETRIEVAL_REQUEST:
+            return await self._http_error(writer, 413, b"Payload Too Large")
         req = await reader.readexactly(length)
         if method != "POST" or path.lower() != pccrr.MAGIC_PATH.lower():
-            return await self.http_error(writer, 404, b"Not Found")
+            return await self._http_error(writer, 404, b"Not Found")
         try:
             rspmanager = self.respond(req)
         except BadRetrievalRequest:
-            return await self.http_error(writer, 400, b"Bad Request")
+            return await self._http_error(writer, 400, b"Bad Request")
         with rspmanager as rsp:
             writer.write(
                 b"HTTP/1.1 200 OK\r\n"
@@ -212,8 +205,8 @@ class RetrievalAsyncIoServer(RetrievalServer):
         return True
 
     @staticmethod
-    async def http_error(writer: asyncio.StreamWriter, status: int,
-                         reason: bytes) -> bool:
+    async def _http_error(writer: asyncio.StreamWriter, status: int,
+                          reason: bytes) -> bool:
         """Send an HTTP error response and close the connection"""
         writer.write(
             b"HTTP/1.1 %d %s\r\n"
