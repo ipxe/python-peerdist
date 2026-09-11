@@ -10,6 +10,7 @@ from contextlib import AbstractContextManager, contextmanager, ExitStack
 from contextvars import ContextVar
 from dataclasses import dataclass, field, InitVar
 from functools import singledispatchmethod
+import http
 import http.client
 import io
 import logging
@@ -20,8 +21,7 @@ from . import pccrr
 from .cache import Cache, CacheKey
 
 
-ctx_peername: ContextVar[str | None] = ContextVar("peername", default=None)
-
+ctx_peername: ContextVar[Any] = ContextVar("peername", default=None)
 
 class LogFilter(logging.Filter):
     """Log message filter"""
@@ -34,9 +34,16 @@ class LogFilter(logging.Filter):
                 record.name = "%s[%s]" % (record.name, peername[0])
         return True
 
-
 logger = logging.getLogger(__name__)
 logger.addFilter(LogFilter())
+
+
+class HttpError(Exception):
+    """HTTP error response"""
+
+    def __init__(self, status: http.HTTPStatus) -> None:
+        super().__init__(status.phrase)
+        self.status = status
 
 
 class BadRetrievalRequest(Exception):
@@ -199,9 +206,11 @@ class RetrievalServer:
         """
         with self.cache[key].reader() as fh:
             if fh is not None:
+                logger.debug("%s-%d: cached", key.segment_id, key.block_index)
                 length = os.fstat(fh.fileno()).st_size
                 yield RetrievalFileResponse(fh=fh, length=length)
             else:
+                logger.debug("%s-%d: missing", key.segment_id, key.block_index)
                 missing = pccrr.MsgBlk(
                     crypto_alg_id=pccrr.CryptoAlgId.NONE,
                     segment_id=key.segment_id,
@@ -228,8 +237,14 @@ class StandaloneRetrievalServer:
     server: RetrievalServer = field(init=False)
     """Transport-agnostic retrieval protocol server"""
 
-    MAX_RETRIEVAL_REQUEST: ClassVar[int] = 65536
+    MAX_REQUEST_LEN: ClassVar[int] = 65536
     """Maximum retrieval protocol request size"""
+
+    IDLE_TIMEOUT: ClassVar[float] = 60
+    """Maximum time to wait for a request on an otherwise idle connection"""
+
+    REQUEST_TIMEOUT: ClassVar[float] = 10
+    """Maximum time to wait for a request in progress"""
 
     def __post_init__(self, cache: Cache) -> None:
         self.server = RetrievalServer(cache)
@@ -264,39 +279,50 @@ class StandaloneRetrievalServer:
 
         Returns `True` iff the connection may be kept alive.
         """
-        # Read until end of headers
+        # Receive request
         try:
-            head = await reader.readuntil(b"\r\n\r\n")
+            # Read until end of headers
+            async with asyncio.timeout(self.IDLE_TIMEOUT):
+                first = await reader.readexactly(1)
+            async with asyncio.timeout(self.REQUEST_TIMEOUT):
+                head = first + await reader.readuntil(b"\r\n\r\n")
+                # Parse request line
+                (start, _, rest) = head.partition(b"\r\n")
+                try:
+                    (method, path, _) = start.decode().split()
+                except (UnicodeDecodeError, ValueError):
+                    raise HttpError(http.HTTPStatus.BAD_REQUEST)
+                # Parse headers and request body
+                headers = http.client.parse_headers(io.BytesIO(rest))
+                try:
+                    length = int(headers["Content-Length"])
+                except (TypeError, ValueError):
+                    raise HttpError(http.HTTPStatus.LENGTH_REQUIRED)
+                if not 0 <= length <= self.MAX_REQUEST_LEN:
+                    raise HttpError(http.HTTPStatus.CONTENT_TOO_LARGE)
+                req = await reader.readexactly(length)
+                # Check request parameters
+                if method != "POST":
+                    raise HttpError(http.HTTPStatus.METHOD_NOT_ALLOWED)
+                if path.lower() != pccrr.MAGIC_PATH.lower():
+                    raise HttpError(http.HTTPStatus.NOT_FOUND)
         except asyncio.LimitOverrunError:
             return False
-        # Parse request line
-        (start, _, rest) = head.partition(b"\r\n")
-        try:
-            (method, path, _) = start.decode().split()
-        except (UnicodeDecodeError, ValueError):
-            return False
-        # Parse headers and request body
-        headers = http.client.parse_headers(io.BytesIO(rest))
-        try:
-            length = int(headers["Content-Length"])
-        except (TypeError, ValueError):
-            return await self.error(writer, 411, b"Length Required")
-        if not 0 <= length <= self.MAX_RETRIEVAL_REQUEST:
-            return await self.error(writer, 413, b"Payload Too Large")
-        req = await reader.readexactly(length)
-        # Check request parameters
-        if method != "POST" or path.lower() != pccrr.MAGIC_PATH.lower():
-            return await self.error(writer, 404, b"Not Found")
+        except TimeoutError:
+            return await self.error(writer, http.HTTPStatus.REQUEST_TIMEOUT)
+        except HttpError as exc:
+            return await self.error(writer, exc.status)
         # Parse request and send response
         with ExitStack() as stack:
             # Generate response
             try:
                 rsp = stack.enter_context(self.server.respond(req))
             except BadRetrievalRequest:
-                return await self.error(writer, 400, b"Bad Request")
+                return await self.error(writer, http.HTTPStatus.BAD_REQUEST)
             except Exception:
                 logger.exception("Could not construct retrieval response")
-                return await self.error(writer, 500, b"Internal Server Error")
+                return await self.error(writer,
+                                        http.HTTPStatus.INTERNAL_SERVER_ERROR)
             # Send response
             writer.write(
                 b"HTTP/1.1 200 OK\r\n"
@@ -319,15 +345,15 @@ class StandaloneRetrievalServer:
         return True
 
     @staticmethod
-    async def error(writer: asyncio.StreamWriter, status: int,
-                    reason: bytes) -> bool:
+    async def error(writer: asyncio.StreamWriter,
+                    status: http.HTTPStatus) -> bool:
         """Send an HTTP error response"""
         writer.write(
             b"HTTP/1.1 %d %s\r\n"
             b"Content-Length: 0\r\n"
             b"Connection: close\r\n"
             b"\r\n"
-            % ( status, reason )
+            % ( status.value, status.phrase.encode() )
         )
         await writer.drain()
         return False
