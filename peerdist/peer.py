@@ -12,14 +12,10 @@ from functools import singledispatchmethod
 import http.client
 import io
 import os
-from typing import assert_never, BinaryIO, TypeAlias
+from typing import assert_never, BinaryIO, ClassVar, TypeAlias
 
 from . import pccrr
 from .cache import Cache, CacheKey
-
-
-MAX_RETRIEVAL_REQUEST = 65536
-"""Maximum retrieval protocol request size (including headers)"""
 
 
 class BadRetrievalRequest(Exception):
@@ -193,6 +189,9 @@ class StandaloneRetrievalServer(RetrievalServer):
     the response.
     """
 
+    MAX_RETRIEVAL_REQUEST: ClassVar[int] = 65536
+    """Maximum retrieval protocol request size (including headers)"""
+
     async def connected(
             self,
             reader: asyncio.StreamReader,
@@ -234,7 +233,7 @@ class StandaloneRetrievalServer(RetrievalServer):
             length = int(headers["Content-Length"])
         except (TypeError, ValueError):
             return await self.respond_error(writer, 411, b"Length Required")
-        if not 0 <= length <= MAX_RETRIEVAL_REQUEST:
+        if not 0 <= length <= self.MAX_RETRIEVAL_REQUEST:
             return await self.respond_error(writer, 413, b"Payload Too Large")
         req = await reader.readexactly(length)
         if method != "POST" or path.lower() != pccrr.MAGIC_PATH.lower():
