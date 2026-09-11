@@ -72,7 +72,48 @@ RetrievalResponseManager: TypeAlias = AbstractContextManager[RetrievalResponse]
 
 @dataclass(frozen=True)
 class RetrievalServer:
-    """Retrieval protocol server"""
+    """Retrieval protocol server
+
+    The retrieval protocol server is fundamentally transport-agnostic:
+    a raw HTTP POST request body can be passed to the `respond` method
+    to obtain the appropriate response body.
+
+    The most efficient way to send the response body is to use
+    `sendfile`, to avoid unnecessarily copying the cached block file
+    through userspace.  Cached blocks are already encrypted and stored
+    in the form of a raw HTTP response body, and the retrieval
+    protocol operates over HTTP rather than HTTPS, so `sendfile` is a
+    perfect match for this use case.
+
+    To facilitate this, the `respond` method acts as a context manager
+    that yields either a `RetrievalBufferResponse` (representing a
+    short response already in memory) or a `RetrievalFileResponse`
+    (representing an opened read-only file handle).  The caller should
+    `match` the returned type and then either transmit the buffers or
+    call `sendfile` accordingly:
+
+        try:
+            rspmanager = retrieval_server.respond(req)
+        except peerdist.peer.BadRetrievalRequest:
+            ... report client error ...
+        with rspmanager as rsp:
+            ... construct headers using rsp.length ...
+            match rsp:
+                case RetrievalBufferResponse(buffers=buffers):
+                    ... transmit buffer content ...
+                case RetrievalFileResponse(fh=fh):
+                    ... use sendfile(..., fh) ...
+
+    The file handle will be automatically closed on exit from the context.
+
+    The `respond` method is non-blocking and can therefore be used in
+    any synchronous or asynchronous server framework.
+
+    The `connected` method may be used as the callback for
+    `asyncio.start_server` to implement a standalone retrieval
+    protocol server, in the absence of any higher-level server
+    framework.
+    """
 
     cache: Cache
     """Underlying block replay cache"""
