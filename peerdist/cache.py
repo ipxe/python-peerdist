@@ -83,6 +83,9 @@ class CacheKey:
         if self.block_index < 0:
             raise ValueError("Invalid block index %d" % self.block_index)
 
+    def __str__(self) -> str:
+        return "%s-%d" % (self.segment_id.hex(), self.block_index)
+
     @property
     def path(self) -> Path:
         """Path for this cache key"""

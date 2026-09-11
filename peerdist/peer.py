@@ -9,6 +9,7 @@ from collections.abc import Buffer, Iterator, Sequence
 from contextlib import AbstractContextManager, contextmanager, ExitStack
 from contextvars import ContextVar
 from dataclasses import dataclass, field, InitVar
+import email.policy
 from functools import singledispatchmethod
 import http
 import http.client
@@ -23,6 +24,7 @@ from .cache import Cache, CacheKey
 
 ctx_peername: ContextVar[Any] = ContextVar("peername", default=None)
 
+
 class LogFilter(logging.Filter):
     """Log message filter"""
 
@@ -33,6 +35,7 @@ class LogFilter(logging.Filter):
             if isinstance(peername, tuple):
                 record.name = "%s[%s]" % (record.name, peername[0])
         return True
+
 
 logger = logging.getLogger(__name__)
 logger.addFilter(LogFilter())
@@ -206,11 +209,11 @@ class RetrievalServer:
         """
         with self.cache[key].reader() as fh:
             if fh is not None:
-                logger.debug("%s-%d: cached", key.segment_id, key.block_index)
+                logger.debug("%s: found", key)
                 length = os.fstat(fh.fileno()).st_size
                 yield RetrievalFileResponse(fh=fh, length=length)
             else:
-                logger.debug("%s-%d: missing", key.segment_id, key.block_index)
+                logger.debug("%s: not found", key)
                 missing = pccrr.MsgBlk(
                     crypto_alg_id=pccrr.CryptoAlgId.NONE,
                     segment_id=key.segment_id,
@@ -279,6 +282,8 @@ class StandaloneRetrievalServer:
 
         Returns `True` iff the connection may be kept alive.
         """
+        # Prepare response headers
+        rspheaders = http.client.HTTPMessage(policy=email.policy.HTTP)
         # Receive request
         try:
             # Read until end of headers
@@ -291,46 +296,46 @@ class StandaloneRetrievalServer:
                 try:
                     (method, path, _) = start.decode().split()
                 except (UnicodeDecodeError, ValueError):
-                    raise HttpError(http.HTTPStatus.BAD_REQUEST)
-                # Parse headers and request body
-                headers = http.client.parse_headers(io.BytesIO(rest))
+                    raise HttpError(http.HTTPStatus.BAD_REQUEST) from None
+                # Parse request headers and body
+                reqheaders = http.client.parse_headers(io.BytesIO(rest))
                 try:
-                    length = int(headers["Content-Length"])
+                    length = int(reqheaders["Content-Length"])
                 except (TypeError, ValueError):
-                    raise HttpError(http.HTTPStatus.LENGTH_REQUIRED)
+                    raise HttpError(http.HTTPStatus.LENGTH_REQUIRED) from None
                 if not 0 <= length <= self.MAX_REQUEST_LEN:
                     raise HttpError(http.HTTPStatus.REQUEST_ENTITY_TOO_LARGE)
                 req = await reader.readexactly(length)
                 # Check request parameters
-                if method != "POST":
-                    raise HttpError(http.HTTPStatus.METHOD_NOT_ALLOWED)
                 if path.lower() != pccrr.MAGIC_PATH.lower():
                     raise HttpError(http.HTTPStatus.NOT_FOUND)
+                if method != "POST":
+                    rspheaders["Allow"] = "POST"
+                    raise HttpError(http.HTTPStatus.METHOD_NOT_ALLOWED)
         except asyncio.LimitOverrunError:
-            return False
+            status = http.HTTPStatus.REQUEST_HEADER_FIELDS_TOO_LARGE
+            return await self.error(writer, status, rspheaders)
         except TimeoutError:
-            return await self.error(writer, http.HTTPStatus.REQUEST_TIMEOUT)
+            status = http.HTTPStatus.REQUEST_TIMEOUT
+            return await self.error(writer, status, rspheaders)
         except HttpError as exc:
-            return await self.error(writer, exc.status)
+            return await self.error(writer, exc.status, rspheaders)
         # Parse request and send response
         with ExitStack() as stack:
             # Generate response
             try:
                 rsp = stack.enter_context(self.server.respond(req))
             except BadRetrievalRequest:
-                return await self.error(writer, http.HTTPStatus.BAD_REQUEST)
+                status = http.HTTPStatus.BAD_REQUEST
+                return await self.error(writer, status, rspheaders)
             except Exception:
                 logger.exception("Could not construct retrieval response")
-                return await self.error(writer,
-                                        http.HTTPStatus.INTERNAL_SERVER_ERROR)
+                status = http.HTTPStatus.INTERNAL_SERVER_ERROR
+                return await self.error(writer, status, rspheaders)
             # Send response
-            writer.write(
-                b"HTTP/1.1 200 OK\r\n"
-                b"Content-Length: %d\r\n"
-                b"Connection: keep-alive\r\n"
-                b"\r\n"
-                % rsp.length
-            )
+            rspheaders["Content-Length"] = str(rsp.length)
+            rspheaders["Connection"] = "keep-alive"
+            writer.write(b"HTTP/1.1 200 OK\r\n" + bytes(rspheaders))
             match rsp:
                 case RetrievalBufferResponse(buffers=buffers):
                     for buf in buffers:
@@ -346,14 +351,14 @@ class StandaloneRetrievalServer:
 
     @staticmethod
     async def error(writer: asyncio.StreamWriter,
-                    status: http.HTTPStatus) -> bool:
+                    status: http.HTTPStatus,
+                    headers: http.client.HTTPMessage) -> bool:
         """Send an HTTP error response"""
+        headers["Content-Length"] = "0"
+        headers["Connection"] = "close"
         writer.write(
-            b"HTTP/1.1 %d %s\r\n"
-            b"Content-Length: 0\r\n"
-            b"Connection: close\r\n"
-            b"\r\n"
-            % ( status.value, status.phrase.encode() )
+            b"HTTP/1.1 %d %s\r\n%s" %
+            (status.value, status.phrase.encode(), bytes(headers))
         )
         await writer.drain()
         return False
