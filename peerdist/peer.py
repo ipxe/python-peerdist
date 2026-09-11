@@ -4,13 +4,15 @@ We implement a simple peer capable of responding to discovery and
 block retrieval requests, backed by an on-disk cache.
 """
 
-from collections.abc import Buffer, Iterator
+import asyncio
+from collections.abc import Buffer, Iterator, Sequence
 from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass
 from functools import singledispatchmethod
+import http.client
 import io
 import os
-from typing import BinaryIO, Self
+from typing import assert_never, BinaryIO, ClassVar, TypeAlias
 
 from . import pccrr
 from .cache import Cache, CacheKey
@@ -21,19 +23,28 @@ class BadRetrievalRequest(Exception):
 
 
 @dataclass(frozen=True)
-class RetrievalRequest:
-    """Retrieval protocol request"""
+class RetrievalBufferResponse:
+    """Retrieval protocol response content as a buffer list"""
 
-    data: Buffer
-    """Request content"""
+    buffers: Sequence[Buffer]
+    """Response content"""
+
+    @property
+    def length(self) -> int:
+        """Response content length"""
+        return sum(memoryview(x).nbytes for x in self.buffers)
+
+    def __bytes__(self) -> bytes:
+        """Response content as raw bytes"""
+        return b''.join(self.buffers)
 
 
 @dataclass(frozen=True)
-class RetrievalResponse:
-    """Retrieval protocol response
+class RetrievalFileResponse:
+    """Retrieval protocol response content as an opened file
 
-    Responses are represented as an opened file-like object to allow
-    for the use of `sendfile()`.
+    Responses may be represented as an opened file-like object to
+    allow for the use of `sendfile`.
     """
 
     fh: BinaryIO
@@ -42,22 +53,17 @@ class RetrievalResponse:
     length: int
     """Response content length"""
 
-    @classmethod
-    def from_file(cls, fh: BinaryIO) -> Self:
-        """Construct retrieval protocol response from a file handle"""
-        length = (os.fstat(fh.fileno()).st_size - fh.tell())
-        return cls(fh=fh, length=length)
+    def __bytes__(self) -> bytes:
+        """Response content as raw bytes
 
-    @classmethod
-    def from_message(cls, msg: pccrr.Message) -> Self:
-        """Construct retrieval protocol response from a message"""
-        data = msg.to_bytes()
-        fh = io.BytesIO(data)
-        length = len(data)
-        return cls(fh=fh, length=length)
+        For maximum efficiency, use `sendfile` on the file-like object
+        instead.
+        """
+        return self.fh.read()
 
 
-RetrievalResponseManager = AbstractContextManager[RetrievalResponse]
+RetrievalResponse: TypeAlias = RetrievalBufferResponse | RetrievalFileResponse
+RetrievalResponseManager: TypeAlias = AbstractContextManager[RetrievalResponse]
 
 
 @dataclass(frozen=True)
@@ -67,29 +73,29 @@ class RetrievalServer:
     cache: Cache
     """Underlying block replay cache"""
 
-    def respond(self, req: RetrievalRequest) -> RetrievalResponseManager:
+    def respond(self, req: Buffer) -> RetrievalResponseManager:
         """Context manager for responding to a retrieval request
 
         Returns a context yielding a `RetrievalResponse` from which
         the response bytes may be read.
         """
         try:
-            msg = pccrr.Request.from_bytes(req.data)
+            msg = pccrr.Request.from_bytes(req)
         except pccrr.DecodeError as exc:
             raise BadRetrievalRequest(str(exc)) from exc
         return self.msg(msg)
 
     @singledispatchmethod
-    def msg(self, req: pccrr.Request) -> RetrievalResponseManager:
+    def msg(self, msg: pccrr.Request) -> RetrievalResponseManager:
         """Context manager for responding to a retrieval protocol message
 
         Returns a context yielding a `RetrievalResponse` from which
         the response bytes may be read.
         """
-        raise TypeError("Unsupported request type %s" % type(req).__name__)
+        raise TypeError("Unsupported request type %s" % type(msg).__name__)
 
     @msg.register
-    def msg_getblks(self, req: pccrr.MsgGetBlks) -> RetrievalResponseManager:
+    def msg_getblks(self, msg: pccrr.MsgGetBlks) -> RetrievalResponseManager:
         """Context manager for responding to a MSG_GETBLKS request
 
         Returns a context yielding a `RetrievalResponse` from which
@@ -100,8 +106,8 @@ class RetrievalServer:
         block ranges list must specify a single block range containing
         only one block.
         """
-        segment_id = req.segment_id
-        ranges = req.req_block_ranges
+        segment_id = msg.segment_id
+        ranges = msg.req_block_ranges
         if len(ranges) != 1:
             raise BadRetrievalRequest("Multiple block ranges")
         if ranges[0].count != 1:
@@ -122,11 +128,99 @@ class RetrievalServer:
         """
         with self.cache[key].reader() as fh:
             if fh is not None:
-                yield RetrievalResponse.from_file(fh)
+                length = (os.fstat(fh.fileno()).st_size - fh.tell())
+                yield RetrievalFileResponse(fh=fh, length=length)
             else:
                 missing = pccrr.MsgBlk(
                     crypto_alg_id=pccrr.CryptoAlgId.NONE,
                     segment_id=key.segment_id,
                     block_index=key.block_index,
                 )
-                yield RetrievalResponse.from_message(missing)
+                buffers = missing.to_buffers()
+                yield RetrievalBufferResponse(buffers=buffers)
+
+
+@dataclass(frozen=True)
+class RetrievalAsyncIoServer(RetrievalServer):
+    """Retrieval protocol server using asyncio
+
+    This may be used to provide the callback handler for use with
+    `asyncio.start_server` to handle a complete retrieval protocol
+    request (including parsing and constructing the HTTP headers).
+
+    If you are hosting the retrieval protocol server within a
+    higher-level web framework such as Flask or aiohttp then ignore
+    this and instead register a route for `pccrr.MAGIC_PATH` that
+    calls `RetrievalServer.respond` to obtain the response.
+    """
+
+    MAX_REQUEST: ClassVar[int] = 65536
+    """Maximum request size (including headers)"""
+
+    async def connected(
+            self,
+            reader: asyncio.StreamReader,
+            writer: asyncio.StreamWriter
+    ) -> bool:
+        """Handle a single server request
+
+        This may be used as the callback handler for
+        `asyncio.start_server()`.
+        """
+        try:
+            head = await reader.readuntil(b"\r\n\r\n")
+        except asyncio.LimitOverrunError:
+            return False
+        (start, _, rest) = head.partition(b"\r\n")
+        try:
+            (method, path, _) = start.decode().split()
+        except (UnicodeDecodeError, ValueError):
+            return False
+        headers = http.client.parse_headers(io.BytesIO(rest))
+        try:
+            length = int(headers["Content-Length"])
+        except (TypeError, ValueError):
+            return await self.http_error(writer, 411, b"Length Required")
+        if not 0 <= length <= self.MAX_REQUEST:
+            return await self.http_error(writer, 413, b"Payload Too Large")
+        req = await reader.readexactly(length)
+        if method != "POST" or path.lower() != pccrr.MAGIC_PATH.lower():
+            return await self.http_error(writer, 404, b"Not Found")
+        try:
+            rspmanager = self.respond(req)
+        except BadRetrievalRequest:
+            return await self.http_error(writer, 400, b"Bad Request")
+        with rspmanager as rsp:
+            writer.write(
+                b"HTTP/1.1 200 OK\r\n"
+                b"Content-Length: %d\r\n"
+                b"Connection: keep-alive\r\n"
+                b"\r\n"
+                % rsp.length
+            )
+            match rsp:
+                case RetrievalBufferResponse(buffers=buffers):
+                    for buf in buffers:
+                        writer.write(memoryview(buf))
+                    await writer.drain()
+                case RetrievalFileResponse(fh=fh):
+                    await writer.drain()
+                    loop = asyncio.get_running_loop()
+                    await loop.sendfile(writer.transport, fh)
+                case _:
+                    assert_never(rsp)
+        return True
+
+    @staticmethod
+    async def http_error(writer: asyncio.StreamWriter, status: int,
+                         reason: bytes) -> bool:
+        """Send an HTTP error response and close the connection"""
+        writer.write(
+            b"HTTP/1.1 %d %s\r\n"
+            b"Content-Length: 0\r\n"
+            b"Connection: close\r\n"
+            b"\r\n"
+            % ( status, reason )
+        )
+        await writer.drain()
+        return False
