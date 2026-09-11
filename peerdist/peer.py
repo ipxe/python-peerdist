@@ -7,7 +7,7 @@ block retrieval requests, backed by an on-disk cache.
 import asyncio
 from collections.abc import Buffer, Iterator, Sequence
 from contextlib import AbstractContextManager, contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import singledispatchmethod
 import http.client
 import io
@@ -66,7 +66,7 @@ RetrievalResponse: TypeAlias = RetrievalBufferResponse | RetrievalFileResponse
 RetrievalResponseManager: TypeAlias = AbstractContextManager[RetrievalResponse]
 
 
-@dataclass(frozen=True)
+@dataclass
 class RetrievalServer:
     """Retrieval protocol server
 
@@ -178,8 +178,8 @@ class RetrievalServer:
                 yield RetrievalBufferResponse(buffers=buffers)
 
 
-@dataclass(frozen=True)
-class StandaloneRetrievalServer(RetrievalServer):
+@dataclass
+class StandaloneRetrievalServer:
     """Standalone retrieval protocol server
 
     If you are hosting the retrieval protocol server within a
@@ -189,8 +189,17 @@ class StandaloneRetrievalServer(RetrievalServer):
     the response.
     """
 
+    cache: Cache
+    """Underlying block replay cache"""
+
+    server: RetrievalServer = field(init=False)
+    """Transport-agnostic retrieval protocol server"""
+
     MAX_RETRIEVAL_REQUEST: ClassVar[int] = 65536
     """Maximum retrieval protocol request size (including headers)"""
+
+    def __post_init__(self) -> None:
+        self.server = RetrievalServer(self.cache)
 
     async def connected(
             self,
@@ -239,7 +248,7 @@ class StandaloneRetrievalServer(RetrievalServer):
         if method != "POST" or path.lower() != pccrr.MAGIC_PATH.lower():
             return await self.respond_error(writer, 404, b"Not Found")
         try:
-            rspmanager = self.response(req)
+            rspmanager = self.server.response(req)
         except BadRetrievalRequest:
             return await self.respond_error(writer, 400, b"Bad Request")
         with rspmanager as rsp:
