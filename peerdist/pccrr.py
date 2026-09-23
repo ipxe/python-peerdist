@@ -77,6 +77,10 @@ class Range:
     count: int = 1
     """Number of blocks in range"""
 
+    @property
+    def range(self) -> range:
+        return range(self.index, (self.index + self.count))
+
 
 class DecodeError(Exception):
     """Malformed protocol data"""
@@ -334,6 +338,40 @@ class Response(Message):
 
 
 @dataclass(kw_only=True)
+class MsgGetBlkList(Request):
+    """Get block list message content"""
+
+    PROT_VER = ProtVer.V1_0
+    MSG_TYPE = MsgType.MSG_GETBLKLIST
+
+    segment_id: bytes
+    """Segment identifier"""
+
+    needed_block_ranges: Sequence[Range] = field(
+        default_factory=lambda: [Range()]
+    )
+    """List of needed block ranges"""
+
+    @classmethod
+    def decode(cls, decoder: Decoder) -> Self:
+        """Decode message"""
+        self = super().decode(decoder)
+        segment_id = bytes(decoder.sized())
+        needed_block_ranges = decoder.ranges()
+        return cls(
+            crypto_alg_id=self.crypto_alg_id,
+            segment_id=segment_id,
+            needed_block_ranges=needed_block_ranges,
+        )
+
+    def encode(self, encoder: Encoder) -> None:
+        """Encode message"""
+        encoder.ranges(self.needed_block_ranges)
+        encoder.sized(self.segment_id)
+        super().encode(encoder)
+
+
+@dataclass(kw_only=True)
 class MsgGetBlks(Request):
     """Get blocks message content"""
 
@@ -372,6 +410,40 @@ class MsgGetBlks(Request):
         """Encode message"""
         encoder.sized(self.vrf)
         encoder.ranges(self.req_block_ranges)
+        encoder.sized(self.segment_id)
+        super().encode(encoder)
+
+
+@dataclass(kw_only=True)
+class MsgBlkList(Response):
+    """Block list message content"""
+
+    PROT_VER = ProtVer.V1_0
+    MSG_TYPE = MsgType.MSG_BLKLIST
+
+    segment_id: bytes
+    """Segment identifier"""
+
+    block_ranges: Sequence[Range] = field(
+        default_factory=lambda: [Range()]
+    )
+    """List of block ranges"""
+
+    @classmethod
+    def decode(cls, decoder: Decoder) -> Self:
+        """Decode message"""
+        self = super().decode(decoder)
+        segment_id = bytes(decoder.sized())
+        block_ranges = decoder.ranges()
+        return cls(
+            crypto_alg_id=self.crypto_alg_id,
+            segment_id=segment_id,
+            block_ranges=block_ranges,
+        )
+
+    def encode(self, encoder: Encoder) -> None:
+        """Encode message"""
+        encoder.ranges(self.block_ranges)
         encoder.sized(self.segment_id)
         super().encode(encoder)
 

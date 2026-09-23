@@ -3,15 +3,18 @@
 import asyncio
 import logging
 
-from peerdist.cache import Cache, CacheKey
+from peerdist.cache import Cache, CacheBlock, CacheResponse
 from peerdist.peer import StandaloneRetrievalServer
 from peerdist.client import RetrievalClient
 
 logging.basicConfig(level=logging.DEBUG)
 
-def cache_miss(cache: Cache, key: CacheKey) -> None:
+def cache_miss(rsp: CacheResponse) -> None:
     """Handle cache miss"""
-    #RetrievalClient(cache).retrieve(key, 'hedgehog')
+    client = RetrievalClient(cache)
+    match rsp:
+        case CacheBlock(segment_id=segment_id, block_index=block_index):
+            client.retrieve(segment_id, block_index, key, 'hedgehog')
 
 
 cache = Cache("/tmp/peerdist-cache", on_miss=cache_miss)

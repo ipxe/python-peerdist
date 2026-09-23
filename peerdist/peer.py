@@ -19,7 +19,7 @@ import os
 from typing import Any, assert_never, BinaryIO, ClassVar, TypeAlias
 
 from . import pccrr
-from .cache import Cache, CacheKey
+from .cache import Cache, CacheBlock
 
 
 ctx_peername: ContextVar[Any] = ContextVar("peername", default=None)
@@ -197,29 +197,29 @@ class RetrievalServer:
             raise BadRetrievalRequest("Block range not for a single block")
         block_index = ranges[0].index
         try:
-            key = CacheKey(segment_id, block_index)
-        except ValueError as exc:
+            block = self.cache[segment_id][block_index]
+        except KeyError as exc:
             raise BadRetrievalRequest(str(exc)) from exc
-        return self.cached(key)
+        return self.cached(block)
 
     @contextmanager
-    def cached(self, key: CacheKey) -> Iterator[RetrievalResponse]:
+    def cached(self, block: CacheBlock) -> Iterator[RetrievalResponse]:
         """Context manager for a response representing a cache entry
 
         Returns a context yielding a `RetrievalResponse` from which
         the response bytes may be read.
         """
-        with self.cache[key].reader() as fh:
+        with block.reader() as fh:
             if fh is not None:
-                logger.debug("%s: found", key)
+                logger.debug("%s: found", block)
                 length = os.fstat(fh.fileno()).st_size
                 yield RetrievalFileResponse(fh=fh, length=length)
             else:
-                logger.debug("%s: not found", key)
+                logger.debug("%s: not found", block)
                 missing = pccrr.MsgBlk(
                     crypto_alg_id=pccrr.CryptoAlgId.NONE,
-                    segment_id=key.segment_id,
-                    block_index=key.block_index,
+                    segment_id=block.segment_id,
+                    block_index=block.block_index,
                 )
                 buffers = missing.to_buffers()
                 yield RetrievalBufferResponse(buffers=buffers)
