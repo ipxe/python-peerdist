@@ -45,7 +45,9 @@ use cases:
 
 """
 
-from collections.abc import Iterator, Mapping
+from __future__ import annotations
+
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager, ExitStack
 from dataclasses import dataclass, field, InitVar
 import os
@@ -121,8 +123,16 @@ class CacheKey:
 class CacheEntry:
     """Block replay cache entry"""
 
-    path: Path
-    """Path representing this cache entry"""
+    cache: Cache
+    """Containing cache"""
+
+    key: CacheKey
+    """Cache key"""
+
+    @property
+    def path(self) -> Path:
+        """Path representing this cache entry"""
+        return (self.cache.path / self.key.path)
 
     def __bool__(self) -> bool:
         """Check if cache entry is present"""
@@ -144,6 +154,7 @@ class CacheEntry:
             try:
                 fh = stack.enter_context(self.path.open(mode='rb'))
             except FileNotFoundError:
+                self.cache.missed(self.key)
                 yield None
             else:
                 yield fh
@@ -209,6 +220,9 @@ class Cache(Mapping[CacheKey, CacheEntry]):
     path: Path = field(init=False)
     """Cache directory (as a path object)"""
 
+    on_miss: Callable[[Cache, CacheKey], None] | None = None
+    """Cache miss callback"""
+
     def __post_init__(self, dirname: os.PathLike[str] | str) -> None:
         self.path = Path(dirname)
         if not self.path.exists():
@@ -218,7 +232,7 @@ class Cache(Mapping[CacheKey, CacheEntry]):
         """Get (possibly empty) cache entry"""
         if not isinstance(key, CacheKey):
             raise KeyError(key)
-        return CacheEntry(self.path / key.path)
+        return CacheEntry(self, key)
 
     def __contains__(self, key: object) -> bool:
         """Check if cache entry exists"""
@@ -248,3 +262,13 @@ class Cache(Mapping[CacheKey, CacheEntry]):
     def __len__(self) -> int:
         """Count cached block files"""
         return sum(1 for _ in self)
+
+    def missed(self, key: CacheKey) -> None:
+        """Report a cache miss
+
+        Invoke the cache miss callback (if any).  The callback cannot
+        change the result of this cache lookup from a miss to a hit,
+        but may schedule a download of the missing block.
+        """
+        if self.on_miss:
+            self.on_miss(self, key)

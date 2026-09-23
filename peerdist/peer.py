@@ -284,7 +284,6 @@ class StandaloneRetrievalServer:
 
         Returns `True` iff the connection may be kept alive.
         """
-        # Prepare response headers
         # Receive request
         try:
             # Read until end of headers
