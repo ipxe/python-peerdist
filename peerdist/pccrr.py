@@ -201,7 +201,7 @@ class Encoder:
         if self.length:
             pad_len = (-size % 4)
             self.raw(bytes(pad_len))
-        if size:
+        if size or split:
             self.raw(data, split=split)
         self.uint32(size)
 
@@ -305,9 +305,6 @@ class Message:
         length = (encoder.length + UINT32x4.size)
         encoder.pack(UINT32x4, self.PROT_VER, self.MSG_TYPE, length,
                      self.crypto_alg_id)
-
-    def release(self) -> None:
-        """Release any memoryview-holding attributes"""
 
 
 @dataclass(kw_only=True)
@@ -510,9 +507,3 @@ class MsgBlk(Response):
         encoder.pack(UINT32x2, self.block_index, self.next_block_index)
         encoder.sized(self.segment_id)
         super().encode(encoder)
-
-    def release(self) -> None:
-        """Release any memoryview-holding attributes"""
-        super().release()
-        if isinstance(self.block, memoryview):
-            self.block.release()

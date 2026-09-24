@@ -177,7 +177,7 @@ class CacheResponse[ResponseT: pccrr.Response](ABC):
             self.unlink()
 
     @contextmanager
-    def editor(self) -> Iterator[ResponseT | None]:
+    def editor(self, sync: bool = False) -> Iterator[ResponseT | None]:
         """Context manager for an editable cached response message
 
         Returns a context yielding an editable version of a cached
@@ -185,7 +185,8 @@ class CacheResponse[ResponseT: pccrr.Response](ABC):
         present in the cache.
 
         The cached response message will be mapped using mmap(), and
-        only modified portions will be overwritten.
+        unmodified portions will not be rewritten.  The length of any
+        variable-length fields within the message may not be changed.
 
         In-place edits are not atomic, and care must be taken not to
         expose an invalid intermediate state.
@@ -202,20 +203,26 @@ class CacheResponse[ResponseT: pccrr.Response](ABC):
                 return
             msg = self.MSG_TYPE.from_bytes(mapped)
             old_buffers = msg.to_buffers()
+            old_lengths = [memoryview(x).nbytes for x in old_buffers]
             yield msg
             new_buffers = msg.to_buffers()
-            old_offset = 0
-            new_offset = 0
+            new_lengths = [memoryview(x).nbytes for x in new_buffers]
+            if new_lengths != old_lengths:
+                raise ValueError("Cannot resize or reshape %s" % self)
+            offset = 0
             for old, new in zip(old_buffers, new_buffers):
-                old_len = memoryview(old).nbytes
-                new_len = memoryview(new).nbytes
-                if new_offset != old_offset or (new is not old and new != old):
-                    fh.seek(new_offset)
+                if new is not old and new != old:
+                    fh.seek(offset)
                     fh.write(new)
-                old_offset += old_len
-                new_offset += new_len
-            fh.truncate(new_offset)
-            msg.release()
+                offset += memoryview(new).nbytes
+                if isinstance(old, memoryview):
+                    old.release()
+                if isinstance(new, memoryview):
+                    new.release()
+            fh.truncate(offset)
+            fh.flush()
+            if sync:
+                os.fsync(fh.fileno())
 
 
 @dataclass
@@ -381,8 +388,6 @@ class CacheSegment(Mapping[int, CacheBlock], CacheResponse[pccrr.MsgBlkList]):
                             ranges[0].count += 1
                         else:
                             ranges.insert(0, pccrr.Range(index=block_index))
-                        ###
-                        blockmsg = None
             except pccrr.DecodeError:
                 pass
         msg = pccrr.MsgBlkList(segment_id=self.segment_id, block_ranges=ranges)
