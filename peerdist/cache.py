@@ -162,12 +162,14 @@ class CacheResponse[ResponseT: pccrr.Response](ABC):
         with ExitStack() as stack:
             try:
                 fh = stack.enter_context(self.path.open(mode="r+b"))
-                mapped = mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_WRITE)
-            except FileNotFoundError:
+                mapped = stack.enter_context(
+                    mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_WRITE)
+                )
+            except (FileNotFoundError, ValueError):
                 yield None
                 return
             yield mapped
-            fh.flush()
+            mapped.flush()
             if sync:
                 os.fsync(fh.fileno())
 
@@ -177,10 +179,7 @@ class CacheResponse[ResponseT: pccrr.Response](ABC):
         with self.reader() as fh:
             if fh is None:
                 return None
-            try:
-                msg = self.MSG_TYPE.from_bytes(fh.read())
-            except pccrr.DecodeError:
-                return None
+            msg = self.MSG_TYPE.from_bytes(fh.read())
         return msg
 
     @msg.setter
@@ -221,13 +220,13 @@ class CacheResponse[ResponseT: pccrr.Response](ABC):
             if mapped is None:
                 yield None
                 return
-            try:
-                msg = self.MSG_TYPE.from_bytes(mapped)
-            except pccrr.DecodeError:
-                yield None
-                return
+            msg = self.MSG_TYPE.from_bytes(mapped)
             yield msg
             views = [memoryview(x) for x in msg.to_buffers(readonly=False)]
+            length = sum(view.nbytes for view in views)
+            if length != len(mapped):
+                raise ValueError("Cannot resize %s from %d to %d bytes" %
+                                 (self, len(mapped), length))
             base = addressof(c_char.from_buffer(mapped))
             offset = 0
             for view in views:
@@ -396,23 +395,27 @@ class CacheSegment(Mapping[int, CacheBlock], CacheResponse[pccrr.MsgBlkList]):
         next_block_index = 0
         for block_index in sorted(self.scan(), reverse=True):
             block = self[block_index]
-            with block.editmsg() as blockmsg:
-                if blockmsg is not None:
-                    blockmsg.next_block_index = next_block_index
-                    next_block_index = block_index
-                    if ranges and ranges[-1].index == (block_index + 1):
-                        ranges[-1].index -= 1
-                        ranges[-1].count += 1
-                    else:
-                        ranges.insert(0, pccrr.Range(index=block_index))
+            try:
+                with block.editmsg() as blockmsg:
+                    if blockmsg is not None:
+                        blockmsg.next_block_index = next_block_index
+                        next_block_index = block_index
+                        if ranges and ranges[0].index == (block_index + 1):
+                            ranges[0].index -= 1
+                            ranges[0].count += 1
+                        else:
+                            ranges.insert(0, pccrr.Range(index=block_index))
+            except pccrr.DecodeError:
+                pass
         msg = pccrr.MsgBlkList(segment_id=self.segment_id, block_ranges=ranges)
         self.msg = msg
 
     def delete(self) -> None:
         """Delete cached segment"""
+        blocks = list(self.values())
         self.unlink()
-        for block in self:
-            del self[block]
+        for block in blocks:
+            block.delete()
 
 
 @dataclass
