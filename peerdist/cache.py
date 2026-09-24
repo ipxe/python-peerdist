@@ -88,8 +88,10 @@ class CacheResponse[ResponseT: pccrr.Response](ABC):
     cache: Cache
     """Containing cache"""
 
-    MSG_TYPE: ClassVar[type[ResponseT]]  # type: ignore[misc]
-    """Response message type"""
+    @staticmethod
+    @abstractmethod
+    def msg_type() -> type[ResponseT]:
+        """Response message type"""
 
     @property
     @abstractmethod
@@ -154,7 +156,7 @@ class CacheResponse[ResponseT: pccrr.Response](ABC):
         with self.reader() as fh:
             if fh is None:
                 return None
-            msg = self.MSG_TYPE.from_bytes(fh.read())
+            msg = self.msg_type().from_bytes(fh.read())
         return msg
 
     @msg.setter
@@ -201,7 +203,7 @@ class CacheResponse[ResponseT: pccrr.Response](ABC):
             except ValueError:
                 yield None
                 return
-            msg = self.MSG_TYPE.from_bytes(mapped)
+            msg = self.msg_type().from_bytes(mapped)
             old_buffers = msg.to_buffers()
             old_lengths = [memoryview(x).nbytes for x in old_buffers]
             try:
@@ -236,9 +238,6 @@ class CacheBlock(CacheResponse[pccrr.MsgBlk]):
     block_index: int = 0
     """Block index within this segment (usually zero)"""
 
-    MSG_TYPE = pccrr.MsgBlk
-    """Response message type"""
-
     def __post_init__(self) -> None:
         if not isinstance(self.block_index, int):
             raise ValueError("Unexpected block index %r" % self.block_index)
@@ -251,6 +250,11 @@ class CacheBlock(CacheResponse[pccrr.MsgBlk]):
     def __bool__(self) -> bool:
         """Check if cached block is present"""
         return self.path.exists()
+
+    @staticmethod
+    def msg_type() -> type[pccrr.MsgBlk]:
+        """Response message type"""
+        return pccrr.MsgBlk
 
     @property
     def relpath(self) -> Path:
@@ -280,9 +284,6 @@ class CacheSegment(Mapping[int, CacheBlock], CacheResponse[pccrr.MsgBlkList]):
     segment_id: bytes
     """Segment identifier (HoHoDK)"""
 
-    MSG_TYPE = pccrr.MsgBlkList
-    """Response message type"""
-
     MAX_SEGMENT_ID_LEN: ClassVar[int] = 64
     """Maximum length of a segment identifier"""
 
@@ -295,6 +296,11 @@ class CacheSegment(Mapping[int, CacheBlock], CacheResponse[pccrr.MsgBlkList]):
 
     def __str__(self) -> str:
         return self.segment_id.hex()
+
+    @staticmethod
+    def msg_type() -> type[pccrr.MsgBlkList]:
+        """Response message type"""
+        return pccrr.MsgBlkList
 
     @property
     def relpath(self) -> Path:
