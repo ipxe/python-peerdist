@@ -25,6 +25,3 @@ Issues = "https://github.com/ipxe/python-peerdist/issues"
 
 [tool.mypy]
 strict = true
-
-[tool.pycodestyle]
-max-line-length = 80

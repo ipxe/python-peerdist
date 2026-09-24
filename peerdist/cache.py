@@ -62,10 +62,7 @@ within each `MSG_BLK` block file header will always be zero.
 When using the Content Information Data Structure Version 1.0, a
 `MSG_BLKLIST` block list file is required to keep track of the blocks
 within each segment, and the next block index within every `MSG_BLK`
-block file header within the segment must be updated to match.  This
-is not yet implemented: the on-disk cache structure is designed to
-allow for version 1.0 to be supported, but the code currently supports
-only version 2.0.
+block file header within the segment must be updated to match.
 """
 
 from __future__ import annotations
@@ -73,8 +70,10 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager, ExitStack
+from ctypes import addressof, c_char
 from dataclasses import dataclass, field, InitVar
 from itertools import chain
+import mmap
 import os
 from pathlib import Path
 import tempfile
@@ -106,7 +105,7 @@ class CacheResponse[ResponseT: pccrr.Response](ABC):
     def missed(self) -> None:
         """Report a cache miss"""
 
-    def delete(self) -> None:
+    def unlink(self) -> None:
         """Delete cached response message"""
         self.path.unlink(missing_ok=True)
 
@@ -124,8 +123,8 @@ class CacheResponse[ResponseT: pccrr.Response](ABC):
             except FileNotFoundError:
                 self.missed()
                 yield None
-            else:
-                yield fh
+                return
+            yield fh
 
     @contextmanager
     def writer(self, sync: bool = False) -> Iterator[BinaryIO]:
@@ -149,18 +148,44 @@ class CacheResponse[ResponseT: pccrr.Response](ABC):
                 os.fsync(tmp.fileno())
             Path(tmp.name).replace(self.path)
 
+    @contextmanager
+    def editor(self, sync: bool = False) -> Iterator[mmap.mmap | None]:
+        """Context manager for editing a cached response message
+
+        Returns a context yielding an `mmap.mmap` that can be edited
+        in place, or `None` if the response message is not present in
+        the cache.
+
+        In-place edits are not atomic, and care must be taken not to
+        expose an invalid intermediate state.
+        """
+        with ExitStack() as stack:
+            try:
+                fh = stack.enter_context(self.path.open(mode="r+b"))
+                mapped = mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_WRITE)
+            except FileNotFoundError:
+                yield None
+                return
+            yield mapped
+            fh.flush()
+            if sync:
+                os.fsync(fh.fileno())
+
     @property
     def msg(self) -> ResponseT | None:
         """Response message content"""
         with self.reader() as fh:
             if fh is None:
                 return None
-            msg = self.MSG_TYPE.from_bytes(fh.read())
+            try:
+                msg = self.MSG_TYPE.from_bytes(fh.read())
+            except pccrr.DecodeError:
+                return None
         return msg
 
     @msg.setter
     def msg(self, msg: ResponseT | None) -> None:
-        """Block message content"""
+        """Response message content"""
         if msg is not None:
             buffers = [memoryview(x) for x in msg.to_buffers()]
             with self.writer() as fh:
@@ -175,7 +200,47 @@ class CacheResponse[ResponseT: pccrr.Response](ABC):
                     if written:
                         buffers[index] = memoryview(buffers[index])[written:]
         else:
-            self.delete()
+            self.unlink()
+
+    @contextmanager
+    def editmsg(self) -> Iterator[ResponseT | None]:
+        """Context manager for an editable cached response message
+
+        Returns a context yielding an editable version of a cached
+        response message, or `None` if the response message is not
+        present in the cache.
+
+        The cached response message will be mapped using mmap(), and
+        only modified portions will be overwritten.  The overall size
+        of the message cannot be changed.
+
+        In-place edits are not atomic, and care must be taken not to
+        expose an invalid intermediate state.
+        """
+        with self.editor() as mapped:
+            if mapped is None:
+                yield None
+                return
+            try:
+                msg = self.MSG_TYPE.from_bytes(mapped)
+            except pccrr.DecodeError:
+                yield None
+                return
+            yield msg
+            views = [memoryview(x) for x in msg.to_buffers(readonly=False)]
+            base = addressof(c_char.from_buffer(mapped))
+            offset = 0
+            for view in views:
+                if (view.obj is mapped and
+                   (offset == (addressof(c_char.from_buffer(view)) - base))):
+                    # In-place mmap() slice: nothing to write
+                    pass
+                elif mapped[offset:(offset + view.nbytes)] == view:
+                    # Unchanged content: nothing to write
+                    pass
+                else:
+                    mapped[offset:(offset + view.nbytes)] = view
+                offset += view.nbytes
 
 
 @dataclass
@@ -220,6 +285,10 @@ class CacheBlock(CacheResponse[pccrr.MsgBlk]):
         """Report a cache miss"""
         self.cache.missed(self)
 
+    def delete(self) -> None:
+        """Delete cached block"""
+        self.unlink()
+
 
 @dataclass
 class CacheSegment(Mapping[int, CacheBlock], CacheResponse[pccrr.MsgBlkList]):
@@ -250,12 +319,6 @@ class CacheSegment(Mapping[int, CacheBlock], CacheResponse[pccrr.MsgBlkList]):
         filename = "%s.lst" % self
         dirname = filename[:2]
         return Path(dirname) / Path(filename)
-
-    def delete(self) -> None:
-        """Delete block list file and all blocks"""
-        for block in self:
-            del self[block]
-        super().delete()
 
     def __getitem__(self, key: object) -> CacheBlock:
         """Get (possibly empty) cached block"""
@@ -315,6 +378,41 @@ class CacheSegment(Mapping[int, CacheBlock], CacheResponse[pccrr.MsgBlkList]):
                 continue
             if block.path == path:
                 yield block.block_index
+
+    def rebuild(self) -> None:
+        """Rebuild block list and next-block indexes
+
+        This should be invoked after storing a block obtained using
+        version 1 content information, to rebuild the block list file
+        and to update the next-block index within all other blocks in
+        the same segment.
+
+        There is no need to call this method for blocks obtained using
+        version 2 content information (where there can only ever be a
+        single block with index zero): doing so would simply create an
+        unnecessary block list file.
+        """
+        ranges: list[pccrr.Range] = []
+        next_block_index = 0
+        for block_index in sorted(self.scan(), reverse=True):
+            block = self[block_index]
+            with block.editmsg() as blockmsg:
+                if blockmsg is not None:
+                    blockmsg.next_block_index = next_block_index
+                    next_block_index = block_index
+                    if ranges and ranges[-1].index == (block_index + 1):
+                        ranges[-1].index -= 1
+                        ranges[-1].count += 1
+                    else:
+                        ranges.insert(0, pccrr.Range(index=block_index))
+        msg = pccrr.MsgBlkList(segment_id=self.segment_id, block_ranges=ranges)
+        self.msg = msg
+
+    def delete(self) -> None:
+        """Delete cached segment"""
+        self.unlink()
+        for block in self:
+            del self[block]
 
 
 @dataclass

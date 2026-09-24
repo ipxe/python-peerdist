@@ -116,7 +116,7 @@ class Decoder:
         if length > self.remaining:
             raise DecodeError("too short for %d bytes at offset %d (of %d)" %
                               (length, offset, self.len))
-        data = self.data[offset:(offset + length)].toreadonly()
+        data = self.data[offset:(offset + length)]
         self.offset += length
         return data
 
@@ -166,7 +166,7 @@ class Encoder:
     @property
     def buffers(self) -> Sequence[Buffer]:
         """List of buffers holding encoded message data"""
-        return (bytes(self.head), *self.tail)
+        return (self.head, *self.tail)
 
     def raw(self, data: Buffer, split: bool = False) -> None:
         """Prepend raw data"""
@@ -174,7 +174,7 @@ class Encoder:
         length = memory.nbytes
         if length:
             if split:
-                self.tail[:0] = (memory, memoryview(self.head).toreadonly())
+                self.tail[:0] = (memory, self.head)
                 self.head = bytearray()
             else:
                 self.head[:0] = memory
@@ -249,11 +249,14 @@ class Message:
                               (decoder.offset, decoder.len))
         return cast(MessageT, self)
 
-    def to_buffers(self) -> Sequence[Buffer]:
+    def to_buffers(self, readonly: bool = True) -> Sequence[Buffer]:
         """Message encoded as a buffer sequence"""
         encoder = Encoder()
         self.encode(encoder)
-        return encoder.buffers
+        buffers = encoder.buffers
+        if readonly:
+            buffers = [memoryview(x).toreadonly() for x in buffers]
+        return buffers
 
     def to_bytes(self) -> bytes:
         """Message encoded as a byte sequence"""

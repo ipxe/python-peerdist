@@ -3,7 +3,7 @@
 all : check build
 
 build :
-	python -m build
+	python3 -m build
 
 check :
 	pycodestyle .
