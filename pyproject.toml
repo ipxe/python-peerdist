@@ -25,3 +25,11 @@ Issues = "https://github.com/ipxe/python-peerdist/issues"
 
 [tool.mypy]
 strict = true
+
+[dependency-groups]
+dev = [
+    "build",
+    "mypy",
+    "pycodestyle",
+    "pyflakes",
+]
