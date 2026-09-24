@@ -103,9 +103,8 @@ class CacheResponse[ResponseT: pccrr.Response](ABC):
         """Path containing cached response message"""
         return self.cache.path / self.relpath
 
-    def __bool__(self) -> bool:
-        """Check if cached response message is present"""
-        return self.path.exists()
+    def missed(self) -> None:
+        """Report a cache miss"""
 
     def delete(self) -> None:
         """Delete cached response message"""
@@ -123,7 +122,7 @@ class CacheResponse[ResponseT: pccrr.Response](ABC):
             try:
                 fh = stack.enter_context(self.path.open(mode="rb"))
             except FileNotFoundError:
-                self.cache.missed(self)
+                self.missed()
                 yield None
             else:
                 yield fh
@@ -201,6 +200,10 @@ class CacheBlock(CacheResponse[pccrr.MsgBlk]):
     def __str__(self) -> str:
         return "%s-%d" % (self.segment, self.block_index)
 
+    def __bool__(self) -> bool:
+        """Check if cached block is present"""
+        return self.path.exists()
+
     @property
     def relpath(self) -> Path:
         """Relative path for block file within the cache"""
@@ -212,6 +215,10 @@ class CacheBlock(CacheResponse[pccrr.MsgBlk]):
     def segment_id(self) -> bytes:
         """Containing segment identifier (HoHoDK)"""
         return self.segment.segment_id
+
+    def missed(self) -> None:
+        """Report a cache miss"""
+        self.cache.missed(self)
 
 
 @dataclass
@@ -227,7 +234,7 @@ class CacheSegment(Mapping[int, CacheBlock], CacheResponse[pccrr.MsgBlkList]):
     MAX_SEGMENT_ID_LEN: ClassVar[int] = 64
     """Maximum length of a segment identifier"""
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         if not isinstance(self.segment_id, bytes):
             raise ValueError("Unexpected segment ID %r" % self.segment_id)
         if not 0 < len(self.segment_id) <= self.MAX_SEGMENT_ID_LEN:
@@ -267,6 +274,15 @@ class CacheSegment(Mapping[int, CacheBlock], CacheResponse[pccrr.MsgBlkList]):
         """Delete cached block"""
         self[key].delete()
 
+    def __bool__(self) -> bool:
+        """Check if any cached block is present in this segment"""
+        if self[0]:
+            return True
+        msg = self.msg
+        if msg is None:
+            return False
+        return any(x.count for x in msg.block_ranges)
+
     def __iter__(self) -> Iterator[int]:
         """Iterate over all cached blocks
 
@@ -280,7 +296,7 @@ class CacheSegment(Mapping[int, CacheBlock], CacheResponse[pccrr.MsgBlkList]):
         msg = self.msg
         if msg is not None:
             yield from chain.from_iterable(x.range for x in msg.block_ranges)
-        if self[0]:
+        elif self[0]:
             yield 0
 
     def __len__(self) -> int:
@@ -292,12 +308,12 @@ class CacheSegment(Mapping[int, CacheBlock], CacheResponse[pccrr.MsgBlkList]):
         parent = self.cache.path / str(self)[:2]
         pattern = "%s-*.blk" % self
         for path in parent.glob(pattern):
-            (segment_id_str, _, block_index_str) = path.stem.rpartition("-")
+            block_index_str = path.stem.rpartition("-")[2]
             try:
                 block = self[int(block_index_str)]
             except ValueError:
-                pass
-            if block is not None and block.path == path:
+                continue
+            if block.path == path:
                 yield block.block_index
 
 
@@ -311,7 +327,7 @@ class Cache(Mapping[bytes, CacheSegment]):
     path: Path = field(init=False)
     """Cache directory (as a path object)"""
 
-    on_miss: Callable[[CacheResponse], None] | None = None
+    on_miss: Callable[[CacheBlock], None] | None = None
     """Cache miss callback"""
 
     def __post_init__(self, dirname: os.PathLike[str] | str) -> None:
@@ -355,12 +371,16 @@ class Cache(Mapping[bytes, CacheSegment]):
         for path in self.path.glob(pattern):
             (segment_id_str, _, block_index_str) = path.stem.rpartition("-")
             try:
-                segment_ids.add(bytes.fromhex(segment_id_str))
+                segment_id = bytes.fromhex(segment_id_str)
+                block_index = int(block_index_str)
+                block = self[segment_id][block_index]
             except ValueError:
-                pass
+                continue
+            if block.path == path:
+                segment_ids.add(segment_id)
         yield from segment_ids
 
-    def missed(self, rsp: CacheResponse) -> None:
+    def missed(self, block: CacheBlock) -> None:
         """Report a cache miss
 
         Invoke the cache miss callback (if any).  The callback cannot
@@ -368,4 +388,4 @@ class Cache(Mapping[bytes, CacheSegment]):
         but may schedule a download of the missing block.
         """
         if self.on_miss:
-            self.on_miss(rsp)
+            self.on_miss(block)

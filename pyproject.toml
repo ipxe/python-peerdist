@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools >= 77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "peerdist"
+version = "0.1.0"
+description = "PeerDist (BranchCache) content retrieval and block replay cache"
+readme = "README.md"
+requires-python = ">= 3.12"
+license = "GPL-2.0-or-later"
+license-files = ["LICENSE"]
+authors = [{name = "Michael Brown", email = "mcb30@ipxe.org"}]
+keywords = ["peerdist", "branchcache", "ipxe"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: System Administrators",
+    "Programming Language :: Python :: 3",
+    "Topic :: System :: Networking",
+]
+
+[project.urls]
+Homepage = "https://github.com/ipxe/python-peerdist"
+Issues = "https://github.com/ipxe/python-peerdist/issues"
+
+[tool.mypy]
+strict = true
+
+[tool.pycodestyle]
+max-line-length = 80
