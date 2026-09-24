@@ -311,14 +311,14 @@ class Message:
 class Request(Message):
     """Request message"""
 
-    _MSG_TYPES: ClassVar[MutableMapping[MsgType, type[Request]]] = {}
+    _MSG_TYPES = {}
 
 
 @dataclass(kw_only=True)
 class Response(Message):
     """Response message"""
 
-    _MSG_TYPES: ClassVar[MutableMapping[MsgType, type[Response]]] = {}
+    _MSG_TYPES = {}
 
     @classmethod
     def autodetect(cls, decoder: Decoder) -> type[Self]:
