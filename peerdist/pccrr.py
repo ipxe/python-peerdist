@@ -116,7 +116,7 @@ class Decoder:
         if length > self.remaining:
             raise DecodeError("too short for %d bytes at offset %d (of %d)" %
                               (length, offset, self.len))
-        data = self.data[offset:(offset + length)]
+        data = self.data[offset:(offset + length)].toreadonly()
         self.offset += length
         return data
 
@@ -170,7 +170,10 @@ class Encoder:
 
     def raw(self, data: Buffer, split: bool = False) -> None:
         """Prepend raw data"""
-        memory = memoryview(data)
+        if isinstance(data, memoryview):
+            memory = data
+        else:
+            memory = memoryview(data)
         length = memory.nbytes
         if length:
             if split:
@@ -249,13 +252,11 @@ class Message:
                               (decoder.offset, decoder.len))
         return cast(MessageT, self)
 
-    def to_buffers(self, readonly: bool = True) -> Sequence[Buffer]:
+    def to_buffers(self) -> Sequence[Buffer]:
         """Message encoded as a buffer sequence"""
         encoder = Encoder()
         self.encode(encoder)
         buffers = encoder.buffers
-        if readonly:
-            buffers = [memoryview(x).toreadonly() for x in buffers]
         return buffers
 
     def to_bytes(self) -> bytes:
@@ -304,6 +305,9 @@ class Message:
         length = (encoder.length + UINT32x4.size)
         encoder.pack(UINT32x4, self.PROT_VER, self.MSG_TYPE, length,
                      self.crypto_alg_id)
+
+    def release(self) -> None:
+        """Release any memoryview-holding attributes"""
 
 
 @dataclass(kw_only=True)
@@ -506,3 +510,9 @@ class MsgBlk(Response):
         encoder.pack(UINT32x2, self.block_index, self.next_block_index)
         encoder.sized(self.segment_id)
         super().encode(encoder)
+
+    def release(self) -> None:
+        """Release any memoryview-holding attributes"""
+        super().release()
+        if isinstance(self.block, memoryview):
+            self.block.release()

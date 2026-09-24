@@ -70,7 +70,6 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager, ExitStack
-from ctypes import addressof, c_char
 from dataclasses import dataclass, field, InitVar
 from itertools import chain
 import mmap
@@ -110,21 +109,22 @@ class CacheResponse[ResponseT: pccrr.Response](ABC):
         self.path.unlink(missing_ok=True)
 
     @contextmanager
-    def reader(self) -> Iterator[BinaryIO | None]:
+    def reader(self, writable: bool = False) -> Iterator[BinaryIO | None]:
         """Context manager for reading a cached response message
 
         Returns a context yielding a file-like object from which the
         cached response message content can be read, or `None` if the
         response message is not present in the cache.
         """
+        mode = "r+b" if writable else "rb"
         with ExitStack() as stack:
             try:
-                fh = stack.enter_context(self.path.open(mode="rb"))
+                fh = stack.enter_context(self.path.open(mode=mode))
             except FileNotFoundError:
                 self.missed()
                 yield None
                 return
-            yield fh
+            yield cast(BinaryIO, fh)
 
     @contextmanager
     def writer(self, sync: bool = False) -> Iterator[BinaryIO]:
@@ -147,31 +147,6 @@ class CacheResponse[ResponseT: pccrr.Response](ABC):
             if sync:
                 os.fsync(tmp.fileno())
             Path(tmp.name).replace(self.path)
-
-    @contextmanager
-    def editor(self, sync: bool = False) -> Iterator[mmap.mmap | None]:
-        """Context manager for editing a cached response message
-
-        Returns a context yielding an `mmap.mmap` that can be edited
-        in place, or `None` if the response message is not present in
-        the cache.
-
-        In-place edits are not atomic, and care must be taken not to
-        expose an invalid intermediate state.
-        """
-        with ExitStack() as stack:
-            try:
-                fh = stack.enter_context(self.path.open(mode="r+b"))
-                mapped = stack.enter_context(
-                    mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_WRITE)
-                )
-            except (FileNotFoundError, ValueError):
-                yield None
-                return
-            yield mapped
-            mapped.flush()
-            if sync:
-                os.fsync(fh.fileno())
 
     @property
     def msg(self) -> ResponseT | None:
@@ -202,7 +177,7 @@ class CacheResponse[ResponseT: pccrr.Response](ABC):
             self.unlink()
 
     @contextmanager
-    def editmsg(self) -> Iterator[ResponseT | None]:
+    def editor(self) -> Iterator[ResponseT | None]:
         """Context manager for an editable cached response message
 
         Returns a context yielding an editable version of a cached
@@ -210,36 +185,37 @@ class CacheResponse[ResponseT: pccrr.Response](ABC):
         present in the cache.
 
         The cached response message will be mapped using mmap(), and
-        only modified portions will be overwritten.  The overall size
-        of the message cannot be changed.
+        only modified portions will be overwritten.
 
         In-place edits are not atomic, and care must be taken not to
         expose an invalid intermediate state.
         """
-        with self.editor() as mapped:
-            if mapped is None:
+        with ExitStack() as stack:
+            fh = stack.enter_context(self.reader(writable=True))
+            if fh is None:
+                yield None
+                return
+            try:
+                mapped = stack.enter_context(mmap.mmap(fh.fileno(), 0))
+            except ValueError:
                 yield None
                 return
             msg = self.MSG_TYPE.from_bytes(mapped)
+            old_buffers = msg.to_buffers()
             yield msg
-            views = [memoryview(x) for x in msg.to_buffers(readonly=False)]
-            length = sum(view.nbytes for view in views)
-            if length != len(mapped):
-                raise ValueError("Cannot resize %s from %d to %d bytes" %
-                                 (self, len(mapped), length))
-            base = addressof(c_char.from_buffer(mapped))
-            offset = 0
-            for view in views:
-                if (view.obj is mapped and
-                   (offset == (addressof(c_char.from_buffer(view)) - base))):
-                    # In-place mmap() slice: nothing to write
-                    pass
-                elif mapped[offset:(offset + view.nbytes)] == view:
-                    # Unchanged content: nothing to write
-                    pass
-                else:
-                    mapped[offset:(offset + view.nbytes)] = view
-                offset += view.nbytes
+            new_buffers = msg.to_buffers()
+            old_offset = 0
+            new_offset = 0
+            for old, new in zip(old_buffers, new_buffers):
+                old_len = memoryview(old).nbytes
+                new_len = memoryview(new).nbytes
+                if new_offset != old_offset or (new is not old and new != old):
+                    fh.seek(new_offset)
+                    fh.write(new)
+                old_offset += old_len
+                new_offset += new_len
+            fh.truncate(new_offset)
+            msg.release()
 
 
 @dataclass
@@ -396,7 +372,7 @@ class CacheSegment(Mapping[int, CacheBlock], CacheResponse[pccrr.MsgBlkList]):
         for block_index in sorted(self.scan(), reverse=True):
             block = self[block_index]
             try:
-                with block.editmsg() as blockmsg:
+                with block.editor() as blockmsg:
                     if blockmsg is not None:
                         blockmsg.next_block_index = next_block_index
                         next_block_index = block_index
@@ -405,6 +381,8 @@ class CacheSegment(Mapping[int, CacheBlock], CacheResponse[pccrr.MsgBlkList]):
                             ranges[0].count += 1
                         else:
                             ranges.insert(0, pccrr.Range(index=block_index))
+                        ###
+                        blockmsg = None
             except pccrr.DecodeError:
                 pass
         msg = pccrr.MsgBlkList(segment_id=self.segment_id, block_ranges=ranges)
