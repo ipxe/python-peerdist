@@ -201,7 +201,7 @@ class Encoder:
         if self.length:
             pad_len = (-size % 4)
             self.raw(bytes(pad_len))
-        if size or split:
+        if size:
             self.raw(data, split=split)
         self.uint32(size)
 

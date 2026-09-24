@@ -204,25 +204,26 @@ class CacheResponse[ResponseT: pccrr.Response](ABC):
             msg = self.MSG_TYPE.from_bytes(mapped)
             old_buffers = msg.to_buffers()
             old_lengths = [memoryview(x).nbytes for x in old_buffers]
-            yield msg
-            new_buffers = msg.to_buffers()
-            new_lengths = [memoryview(x).nbytes for x in new_buffers]
-            if new_lengths != old_lengths:
-                raise ValueError("Cannot resize or reshape %s" % self)
-            offset = 0
-            for old, new in zip(old_buffers, new_buffers):
-                if new is not old and new != old:
-                    fh.seek(offset)
-                    fh.write(new)
-                offset += memoryview(new).nbytes
-                if isinstance(old, memoryview):
-                    old.release()
-                if isinstance(new, memoryview):
-                    new.release()
-            fh.truncate(offset)
-            fh.flush()
-            if sync:
-                os.fsync(fh.fileno())
+            try:
+                yield msg
+                new_buffers = msg.to_buffers()
+                new_lengths = [memoryview(x).nbytes for x in new_buffers]
+                if new_lengths != old_lengths:
+                    raise ValueError("Cannot resize or reshape %s" % self)
+                offset = 0
+                for old, new in zip(old_buffers, new_buffers):
+                    if new is not old and new != old:
+                        fh.seek(offset)
+                        fh.write(new)
+                    offset += memoryview(new).nbytes
+                fh.truncate(offset)
+                fh.flush()
+                if sync:
+                    os.fsync(fh.fileno())
+            finally:
+                for old in old_buffers:
+                    if isinstance(old, memoryview):
+                        old.release()
 
 
 @dataclass
