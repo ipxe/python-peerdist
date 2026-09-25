@@ -237,10 +237,6 @@ class ProbeMatchV1(ProbeMatch, MessageV1):
     """Block counts"""
 
     @property
-    def scopes(self) -> str:
-        return " ".join(x.hex().upper() for x in self.segment_ids)
-
-    @property
     def peerdist_data(self) -> ET.Element:
         peerdist_data = ET.Element(f"{{{PEERDIST}}}PeerDistData")
         block_count = ET.SubElement(peerdist_data, f"{{{PEERDIST}}}BlockCount")
