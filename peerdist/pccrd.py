@@ -3,9 +3,14 @@
 The Discovery Protocol is used for discovery of peers that hold
 particular encrypted blocks.  It is based upon the Web Service Dynamic
 Discovery Protocol (WSD), which in turn uses SOAP-over-UDP.
+
+Note that some receivers (e.g. iPXE) do not include full XML parsers
+but instead use substring matching.  Such receivers may rely upon the
+specific choices for namespace prefixes, and may not correctly handle
+otherwise valid messages (e.g. self-closing XML tags).
 """
 
-from abc import abstractmethod
+from abc import ABC, abstractmethod
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import cast, ClassVar
@@ -14,6 +19,7 @@ from xml.etree import ElementTree as ET
 
 
 DEFAULT_ADDRESS = uuid.uuid4()
+"""Per-endpoint unique identifier"""
 
 
 PEERDIST_PREFIX = "PeerDist"
@@ -48,7 +54,7 @@ class XAddr:
 
 
 @dataclass(kw_only=True)
-class Message:
+class Message(ABC):
     """A discovery message"""
 
     WSA_TO: ClassVar[str]
@@ -73,7 +79,7 @@ class Message:
     """Segment identifiers"""
 
     def __bytes__(self) -> bytes:
-        root = self.tree.getroot()
+        root = self.envelope
         encoded = ET.tostring(root, encoding="utf-8", xml_declaration=True)
         return cast(bytes, encoded)
 
@@ -103,7 +109,7 @@ class Message:
         action = ET.SubElement(header, f"{{{WSA}}}Action")
         action.text = self.WSA_ACTION
         message_id = ET.SubElement(header, f"{{{WSA}}}MessageID")
-        message_id.text = str(self.message_id)
+        message_id.text = self.message_id.urn
         return header
 
     @property
@@ -119,25 +125,6 @@ class Message:
 
 
 @dataclass(kw_only=True)
-class MessageV1(Message):
-    """A version 1.0 message"""
-
-    PEERDIST_TYPE = "PeerDistData"
-    MATCH_BY = "http://schemas.xmlsoap.org/ws/2005/04/discovery/strcmp0"
-    METADATA_VERSION = 1
-
-
-@dataclass(kw_only=True)
-class MessageV2(Message):
-    """A version 2.0 message"""
-
-    PEERDIST_TYPE = "PeerDistDataV2"
-    MATCH_BY = \
-        "http://schemas.microsoft.com/p2p/2010/05/PeerDistV2MatchingRule"
-    METADATA_VERSION = 2
-
-
-@dataclass(kw_only=True)
 class Probe(Message):
     """A probe request"""
 
@@ -145,10 +132,10 @@ class Probe(Message):
     WSA_ACTION = "http://schemas.xmlsoap.org/ws/2005/04/discovery/Probe"
 
     @property
-    def tree(self) -> ET.ElementTree:
-        tree = super().tree
-        tree.getroot().set("xmlns:%s" % PEERDIST_PREFIX, PEERDIST)
-        return tree
+    def envelope(self) -> ET.Element:
+        envelope = super().envelope
+        envelope.set("xmlns:%s" % PEERDIST_PREFIX, PEERDIST)
+        return envelope
 
     @property
     def body(self) -> ET.Element:
@@ -166,8 +153,8 @@ class Probe(Message):
 class ProbeMatch(Message):
     """A probe match response"""
 
-    WSA_TO = "urn:schemas-xmlsoap-org:ws:2005:04:discovery"
-    WSA_ACTION = "http://schemas.xmlsoap.org/ws/2005/04/discovery/Probe"
+    WSA_TO = "http://schemas.xmlsoap.org/ws/2004/08/addressing/role/anonymous"
+    WSA_ACTION = "http://schemas.xmlsoap.org/ws/2005/04/discovery/ProbeMatches"
 
     PEERDIST_TYPE: ClassVar[str]
     """PeerDist data type"""
@@ -191,7 +178,7 @@ class ProbeMatch(Message):
     def header(self) -> ET.Element:
         header = super().header
         relates_to = ET.SubElement(header, f"{{{WSA}}}RelatesTo")
-        relates_to.text = str(self.relates_to)
+        relates_to.text = self.relates_to.urn
         app_sequence = ET.SubElement(header, f"{{{WSA}}}AppSequence")
         app_sequence.set("InstanceId", str(self.instance_id))
         app_sequence.set("MessageNumber", str(self.message_number))
@@ -213,7 +200,7 @@ class ProbeMatch(Message):
         xaddrs = ET.SubElement(probe_match, f"{{{WSD}}}XAddrs")
         xaddrs.text = " ".join("%s:%d" % (x.host, x.port) for x in self.xaddrs)
         metadata_version = ET.SubElement(probe_match,
-                                         f"{{{WSD}}}MetadataVersion""")
+                                         f"{{{WSD}}}MetadataVersion")
         metadata_version.text = str(self.METADATA_VERSION)
         probe_match.append(self.peerdist_data)
         return body
@@ -225,8 +212,12 @@ class ProbeMatch(Message):
 
 
 @dataclass(kw_only=True)
-class ProbeV1(Probe, MessageV1):
-    """A version 1.0 probe request"""
+class MessageV1(Message):
+    """A version 1.0 message"""
+
+    PEERDIST_TYPE = "PeerDistData"
+    MATCH_BY = "http://schemas.xmlsoap.org/ws/2005/04/discovery/strcmp0"
+    METADATA_VERSION = 1
 
     @property
     def scopes(self) -> str:
@@ -234,15 +225,34 @@ class ProbeV1(Probe, MessageV1):
 
 
 @dataclass(kw_only=True)
+class ProbeV1(Probe, MessageV1):
+    """A version 1.0 probe request"""
+
+
+@dataclass(kw_only=True)
 class ProbeMatchV1(ProbeMatch, MessageV1):
     """A version 1.0 probe match response"""
 
-    block_count: int = 1
-    """Block count"""
+    block_counts: Sequence[int] = field(default_factory=list)
+    """Block counts"""
+
+    @property
+    def scopes(self) -> str:
+        return " ".join(x.hex().upper() for x in self.segment_ids)
 
     @property
     def peerdist_data(self) -> ET.Element:
         peerdist_data = ET.Element(f"{{{PEERDIST}}}PeerDistData")
         block_count = ET.SubElement(peerdist_data, f"{{{PEERDIST}}}BlockCount")
-        block_count.text = "%08X" % self.block_count
+        block_count.text = "".join("%08X" % x for x in self.block_counts)
         return peerdist_data
+
+
+@dataclass(kw_only=True)
+class MessageV2(Message):
+    """A version 2.0 message"""
+
+    PEERDIST_TYPE = "PeerDistDataV2"
+    MATCH_BY = \
+        "http://schemas.microsoft.com/p2p/2010/05/PeerDistV2MatchingRule"
+    METADATA_VERSION = 2
